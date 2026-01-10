@@ -1,14 +1,17 @@
-// cmd/godelta/compress.go
+// cmd/godelta/compress_cmd.go
 
 package main
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sync"
 
-	"github.com/cheggaaa/pb/v3"
 	"github.com/spf13/cobra"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 
 	"github.com/creativeyann17/go-delta/pkg/compress"
 )
@@ -65,82 +68,94 @@ func compressCmd() *cobra.Command {
 			log("Starting compression...")
 			log("  Input:       %s", opts.InputPath)
 			log("  Output:      %s", opts.OutputPath)
-			log("  Max threads: %d", opts.MaxThreads)
+			log("  Threads:     %d", opts.MaxThreads)
 			log("  Level:       %d", opts.Level)
 			if dryRun {
 				log("  Mode:        DRY-RUN (no data written)")
 			}
-			if verbose {
-				log("  Mode:        VERBOSE (detailed output)")
-			}
 			log("")
 
-			// Setup progress bars
-			var overallBar *pb.ProgressBar
+			// Multi-progress bar container
+			var progress *mpb.Progress
+			var overallBar *mpb.Bar
+			var fileBars sync.Map // map[string]*mpb.Bar
 
 			if !quiet {
-				overallBar = pb.New(0) // Will set max when we know file count
-				overallBar.SetTemplateString(`{{counters}} {{bar}} {{percent | green}} | {{time .}}`)
-				overallBar.SetMaxWidth(80)
+				progress = mpb.New(
+					mpb.WithWidth(60),
+					mpb.WithRefreshRate(100),
+				)
 			}
-
-			processedFiles := 0
 
 			// Progress callback
 			progressCb := func(event compress.ProgressEvent) {
-				if quiet {
+				if quiet || progress == nil {
 					return
 				}
 
 				switch event.Type {
 				case compress.EventStart:
-					if overallBar != nil {
-						overallBar.SetTotal(event.Total)
-						overallBar.Start()
-					}
+					// Create overall progress bar (at bottom via priority)
+					overallBar = progress.AddBar(event.Total,
+						mpb.PrependDecorators(
+							decor.Name("Total", decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+							decor.CountersNoUnit("%d / %d", decor.WCSyncWidth),
+						),
+						mpb.AppendDecorators(
+							decor.Percentage(decor.WC{W: 5}),
+						),
+						mpb.BarPriority(1000), // High priority = bottom
+					)
 
 				case compress.EventFileStart:
-					if verbose {
-						fmt.Printf("  Compressing %s (%.1f MiB)...\n",
-							event.FilePath,
-							float64(event.Total)/1024/1024)
+					// Create a bar for this file
+					shortName := truncateLeft(event.FilePath, 30)
+					bar := progress.AddBar(event.Total,
+						mpb.PrependDecorators(
+							decor.Name(shortName, decor.WC{C: decor.DindentRight | decor.DextraSpace, W: 32}),
+						),
+						mpb.AppendDecorators(
+							decor.CountersKibiByte("% .1f / % .1f", decor.WCSyncWidth),
+							decor.Percentage(decor.WC{W: 5}),
+						),
+						mpb.BarRemoveOnComplete(),
+					)
+					fileBars.Store(event.FilePath, bar)
+
+				case compress.EventFileProgress:
+					if bar, ok := fileBars.Load(event.FilePath); ok {
+						bar.(*mpb.Bar).SetCurrent(event.Current)
 					}
-					// Create per-file progress bar (optional - can be overwhelming with many threads)
-					// For now, we'll skip per-file bars to avoid clutter
 
 				case compress.EventFileComplete:
-					processedFiles++
+					if bar, ok := fileBars.Load(event.FilePath); ok {
+						bar.(*mpb.Bar).SetCurrent(event.Total)
+						fileBars.Delete(event.FilePath)
+					}
 					if overallBar != nil {
 						overallBar.Increment()
 					}
-					if verbose {
-						ratio := float64(event.CompressedSize) / float64(event.Total) * 100
-						fmt.Printf("  Finished %s → %.1f MiB (%.1f%%)\n",
-							event.FilePath,
-							float64(event.CompressedSize)/1024/1024,
-							ratio)
-					}
 
 				case compress.EventError:
-					if verbose {
-						fmt.Fprintf(os.Stderr, "  Error on %s\n", event.FilePath)
+					if bar, ok := fileBars.Load(event.FilePath); ok {
+						bar.(*mpb.Bar).Abort(true)
+						fileBars.Delete(event.FilePath)
 					}
-					processedFiles++
 					if overallBar != nil {
 						overallBar.Increment()
 					}
 
 				case compress.EventComplete:
-					// Final progress update handled after Compress() returns
+					// Handled after Compress returns
 				}
 			}
 
 			// Perform compression
 			result, err := compress.Compress(opts, progressCb)
 
-			// Finish progress bar before printing summary
-			if overallBar != nil {
-				overallBar.Finish()
+			// Wait for progress bars to finish rendering
+			if progress != nil {
+				progress.Wait()
 			}
 
 			if err != nil {
@@ -148,7 +163,7 @@ func compressCmd() *cobra.Command {
 			}
 
 			// Final report
-			fmt.Printf("\n")
+			fmt.Println()
 
 			if len(result.Errors) > 0 {
 				fmt.Fprintf(os.Stderr, "Completed with %d errors:\n", len(result.Errors))
@@ -160,16 +175,16 @@ func compressCmd() *cobra.Command {
 
 			ratio := result.CompressionRatio()
 			fmt.Printf("Summary:\n")
-			fmt.Printf("  Files successfully processed: %d / %d\n", result.FilesProcessed, result.FilesTotal)
-			fmt.Printf("  Original size:                %.2f MiB\n", float64(result.OriginalSize)/1024/1024)
+			fmt.Printf("  Files processed: %d / %d\n", result.FilesProcessed, result.FilesTotal)
+			fmt.Printf("  Original size:   %.2f MiB\n", float64(result.OriginalSize)/1024/1024)
 
 			if dryRun {
-				fmt.Printf("  Estimated compressed size:    %.2f MiB (rough)\n", float64(result.CompressedSize)/1024/1024)
+				fmt.Printf("  Compressed size: %.2f MiB (estimated)\n", float64(result.CompressedSize)/1024/1024)
 			} else {
-				fmt.Printf("  Compressed size:              %.2f MiB\n", float64(result.CompressedSize)/1024/1024)
+				fmt.Printf("  Compressed size: %.2f MiB\n", float64(result.CompressedSize)/1024/1024)
 			}
 
-			fmt.Printf("  Compression ratio:            %.1f%%\n", ratio)
+			fmt.Printf("  Ratio:           %.1f%%\n", ratio)
 
 			if dryRun {
 				fmt.Println("\nDry run complete - no archive written.")
@@ -195,4 +210,20 @@ func compressCmd() *cobra.Command {
 	_ = cmd.MarkFlagRequired("input")
 
 	return cmd
+}
+
+// truncateLeft truncates a path from the left to fit maxLen, preserving the filename
+func truncateLeft(path string, maxLen int) string {
+	if len(path) <= maxLen {
+		return path
+	}
+
+	// Try to preserve at least the filename
+	filename := filepath.Base(path)
+	if len(filename) >= maxLen-3 {
+		return "..." + filename[len(filename)-(maxLen-3):]
+	}
+
+	// Truncate from left with ellipsis
+	return "..." + path[len(path)-(maxLen-3):]
 }

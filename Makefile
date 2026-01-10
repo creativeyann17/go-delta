@@ -29,7 +29,7 @@ build-all: install
 clean:
 	rm -rf bin/ dist/
 
-test:
+test: install
 	go test ./... -v
 
 fmt:

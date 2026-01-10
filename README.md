@@ -1,5 +1,10 @@
 # go-delta
 
+[![Build and Release](https://github.com/creativeyann17/go-delta/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/creativeyann17/go-delta/actions/workflows/build-and-release.yml)
+[![GitHub release](https://img.shields.io/github/v/release/creativeyann17/go-delta)](https://github.com/creativeyann17/go-delta/releases/latest)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/creativeyann17/go-delta)](go.mod)
+[![License](https://img.shields.io/github/license/creativeyann17/go-delta)](LICENSE)
+
 A smart delta compression tool for backups written in Go.
 
 ## Features

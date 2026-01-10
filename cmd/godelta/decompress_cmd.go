@@ -5,10 +5,11 @@ package main
 import (
 	"fmt"
 	"os"
-	"runtime"
+	"sync"
 
-	"github.com/cheggaaa/pb/v3"
 	"github.com/spf13/cobra"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 
 	"github.com/creativeyann17/go-delta/pkg/decompress"
 )
@@ -19,7 +20,6 @@ func init() {
 
 func decompressCmd() *cobra.Command {
 	var inputPath, outputPath string
-	var maxThreads int
 	var verbose bool
 	var quiet bool
 	var overwrite bool
@@ -37,7 +37,6 @@ func decompressCmd() *cobra.Command {
 			opts := &decompress.Options{
 				InputPath:  inputPath,
 				OutputPath: outputPath,
-				MaxThreads: maxThreads,
 				Verbose:    verbose,
 				Quiet:      quiet,
 				Overwrite:  overwrite,
@@ -58,77 +57,92 @@ func decompressCmd() *cobra.Command {
 			log("Starting decompression...")
 			log("  Input:       %s", opts.InputPath)
 			log("  Output:      %s", opts.OutputPath)
-			log("  Max threads: %d", opts.MaxThreads)
 			if overwrite {
 				log("  Mode:        OVERWRITE (replacing existing files)")
 			}
-			if verbose {
-				log("  Mode:        VERBOSE (detailed output)")
-			}
 			log("")
 
-			// Setup progress bar
-			var overallBar *pb.ProgressBar
+			// Multi-progress bar container
+			var progress *mpb.Progress
+			var overallBar *mpb.Bar
+			var fileBars sync.Map // map[string]*mpb.Bar
 
 			if !quiet {
-				overallBar = pb.New(0)
-				overallBar.SetTemplateString(`{{counters}} {{bar}} {{percent | green}} | {{time .}}`)
-				overallBar.SetMaxWidth(80)
+				progress = mpb.New(
+					mpb.WithWidth(60),
+					mpb.WithRefreshRate(100),
+				)
 			}
-
-			processedFiles := 0
 
 			// Progress callback
 			progressCb := func(event decompress.ProgressEvent) {
-				if quiet {
+				if quiet || progress == nil {
 					return
 				}
 
 				switch event.Type {
 				case decompress.EventStart:
-					if overallBar != nil {
-						overallBar.SetTotal(event.Total)
-						overallBar.Start()
-					}
+					// Create overall progress bar (at bottom via priority)
+					overallBar = progress.AddBar(event.Total,
+						mpb.PrependDecorators(
+							decor.Name("Total", decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+							decor.CountersNoUnit("%d / %d", decor.WCSyncWidth),
+						),
+						mpb.AppendDecorators(
+							decor.Percentage(decor.WC{W: 5}),
+						),
+						mpb.BarPriority(1000), // High priority = bottom
+					)
 
 				case decompress.EventFileStart:
-					if verbose {
-						fmt.Printf("  Decompressing %s (%.1f MiB)...\n",
-							event.FilePath,
-							float64(event.Total)/1024/1024)
+					// Create a bar for this file
+					shortName := truncateLeft(event.FilePath, 30)
+					bar := progress.AddBar(event.Total,
+						mpb.PrependDecorators(
+							decor.Name(shortName, decor.WC{C: decor.DindentRight | decor.DextraSpace, W: 32}),
+						),
+						mpb.AppendDecorators(
+							decor.CountersKibiByte("% .1f / % .1f", decor.WCSyncWidth),
+							decor.Percentage(decor.WC{W: 5}),
+						),
+						mpb.BarRemoveOnComplete(),
+					)
+					fileBars.Store(event.FilePath, bar)
+
+				case decompress.EventFileProgress:
+					if bar, ok := fileBars.Load(event.FilePath); ok {
+						bar.(*mpb.Bar).SetCurrent(event.Current)
 					}
 
 				case decompress.EventFileComplete:
-					processedFiles++
+					if bar, ok := fileBars.Load(event.FilePath); ok {
+						bar.(*mpb.Bar).SetCurrent(event.Total)
+						fileBars.Delete(event.FilePath)
+					}
 					if overallBar != nil {
 						overallBar.Increment()
 					}
-					if verbose {
-						fmt.Printf("  Finished %s → %.1f MiB\n",
-							event.FilePath,
-							float64(event.DecompressedSize)/1024/1024)
-					}
 
 				case decompress.EventError:
-					if verbose {
-						fmt.Fprintf(os.Stderr, "  Error on %s\n", event.FilePath)
+					if bar, ok := fileBars.Load(event.FilePath); ok {
+						bar.(*mpb.Bar).Abort(true)
+						fileBars.Delete(event.FilePath)
 					}
-					processedFiles++
 					if overallBar != nil {
 						overallBar.Increment()
 					}
 
 				case decompress.EventComplete:
-					// Final progress update handled after Decompress() returns
+					// Handled after Decompress returns
 				}
 			}
 
 			// Perform decompression
 			result, err := decompress.Decompress(opts, progressCb)
 
-			// Finish progress bar before printing summary
-			if overallBar != nil {
-				overallBar.Finish()
+			// Wait for progress bars to finish rendering
+			if progress != nil {
+				progress.Wait()
 			}
 
 			if err != nil {
@@ -161,7 +175,6 @@ func decompressCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&inputPath, "input", "i", "", "Input archive file (required)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", ".", "Output directory")
-	cmd.Flags().IntVarP(&maxThreads, "threads", "t", runtime.NumCPU(), "Max concurrent threads")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Minimal output (overrides verbose)")
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Overwrite existing files")
