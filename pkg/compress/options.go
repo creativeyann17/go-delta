@@ -18,6 +18,11 @@ type Options struct {
 	// Default: runtime.NumCPU()
 	MaxThreads int
 
+	// Maximum memory per thread before flushing to disk (bytes)
+	// 0 = unlimited (flush only at folder boundaries)
+	// Default: 0
+	MaxThreadMemory uint64
+
 	// Compression level (1-22 for zstd)
 	// 1=fastest, 9=balanced, 19+=maximum compression
 	// Default: 5
@@ -40,11 +45,12 @@ type Options struct {
 // DefaultOptions returns options with sensible defaults
 func DefaultOptions() *Options {
 	return &Options{
-		MaxThreads: runtime.NumCPU(),
-		Level:      5,
-		DryRun:     false,
-		Verbose:    false,
-		Quiet:      false,
+		MaxThreads:      runtime.NumCPU(),
+		MaxThreadMemory: 0, // Unlimited by default
+		Level:           5,
+		DryRun:          false,
+		Verbose:         false,
+		Quiet:           false,
 	}
 }
 

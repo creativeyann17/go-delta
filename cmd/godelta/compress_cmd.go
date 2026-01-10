@@ -23,6 +23,7 @@ func init() {
 func compressCmd() *cobra.Command {
 	var inputPath, outputPath string
 	var maxThreads int
+	var threadMemoryMB uint64
 	var dryRun bool
 	var verbose bool
 	var quiet bool
@@ -39,13 +40,14 @@ func compressCmd() *cobra.Command {
 
 			// Prepare options
 			opts := &compress.Options{
-				InputPath:  inputPath,
-				OutputPath: outputPath,
-				MaxThreads: maxThreads,
-				Level:      compressLevel,
-				DryRun:     dryRun,
-				Verbose:    verbose,
-				Quiet:      quiet,
+				InputPath:       inputPath,
+				OutputPath:      outputPath,
+				MaxThreads:      maxThreads,
+				MaxThreadMemory: threadMemoryMB * 1024 * 1024, // Convert MB to bytes
+				Level:           compressLevel,
+				DryRun:          dryRun,
+				Verbose:         verbose,
+				Quiet:           quiet,
 			}
 
 			// Validate and set defaults
@@ -70,6 +72,9 @@ func compressCmd() *cobra.Command {
 			log("  Output:      %s", opts.OutputPath)
 			log("  Threads:     %d", opts.MaxThreads)
 			log("  Level:       %d", opts.Level)
+			if opts.MaxThreadMemory > 0 {
+				log("  Thread Mem:  %d MB", opts.MaxThreadMemory/(1024*1024))
+			}
 			if dryRun {
 				log("  Mode:        DRY-RUN (no data written)")
 			}
@@ -201,6 +206,7 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&inputPath, "input", "i", "", "Input file or directory (required)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "Output archive file")
 	cmd.Flags().IntVarP(&maxThreads, "threads", "t", runtime.NumCPU(), "Max concurrent threads")
+	cmd.Flags().Uint64Var(&threadMemoryMB, "thread-memory", 0, "Max memory per thread in MB (0=unlimited)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Simulate without writing anything")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Minimal output (overrides verbose)")

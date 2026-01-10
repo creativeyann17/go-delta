@@ -10,8 +10,10 @@ A smart delta compression tool for backups written in Go.
 ## Features
 
 - **Zstandard compression** - Industry-leading compression with configurable levels (1-22)
-- **Multi-threaded compression** - Utilize all CPU cores for fast parallel compression
+- **True parallel compression** - Folder-based worker pool with independent compression (no mutex contention)
+- **Memory-aware processing** - Configurable per-thread memory limits with automatic flushing
 - **Subdirectory support** - Recursively compress directory structures
+- **Progress visualization** - Multi-bar progress tracking for concurrent operations
 - **CLI and Library** - Use as a command-line tool or Go library
 - **Compress & Decompress** - Full round-trip support with integrity validation
 - **Overwrite protection** - Safe decompression with optional overwrite mode
@@ -57,6 +59,13 @@ godelta compress \
   --level 9 \
   --verbose
 
+# Memory-constrained system (limit each thread to 128MB)
+godelta compress \
+  --input /data \
+  --output archive.delta \
+  --threads 4 \
+  --thread-memory 128
+
 # Dry run to see what would be compressed
 godelta compress -i /data -o test.delta --dry-run
 ```
@@ -79,6 +88,7 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 - `-i, --input`: Input file or directory (required)
 - `-o, --output`: Output archive file (default: "archive.delta")
 - `-t, --threads`: Max concurrent threads (default: CPU count)
+- `--thread-memory`: Max memory per thread in MB (default: 0 = unlimited)
 - `-l, --level`: Compression level 1-22 (default: 5)
 - `--dry-run`: Simulate without writing
 - `--verbose`: Show detailed output
@@ -88,7 +98,6 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 
 - `-i, --input`: Input archive file (required)
 - `-o, --output`: Output directory (default: current directory)
-- `-t, --threads`: Max concurrent threads (default: CPU count)
 - `--overwrite`: Overwrite existing files
 - `--verbose`: Show detailed output
 - `--quiet`: Minimal output
@@ -101,6 +110,37 @@ go-delta uses the GDELTA01 archive format:
 - **Compressed data**: Zstandard-compressed file contents
 
 Files are stored sequentially with entry headers followed immediately by compressed data.
+
+## Architecture
+
+### Folder-Based Parallelism
+
+go-delta achieves true parallel compression by grouping files by their parent directory:
+
+1. **File Grouping**: Files are organized into folder-based tasks
+2. **Parallel Compression**: Workers compress files to memory buffers independently (no locks)
+3. **Minimal Mutex Locking**: Lock only during quick archive writes, not during slow compression
+4. **Memory Management**: Optional per-thread memory limits with automatic flushing
+
+**Example workflow with 4 threads:**
+```
+Worker 1: Compress /src/utils/* → [lock] → Write batch → [unlock]
+Worker 2: Compress /src/models/* → [lock] → Write batch → [unlock]  (parallel!)
+Worker 3: Compress /docs/* → [lock] → Write batch → [unlock]
+Worker 4: Compress /tests/* → [lock] → Write batch → [unlock]
+```
+
+**Memory-aware flushing** (when `--thread-memory` is set):
+- Workers flush to disk whenever accumulated compressed data exceeds threshold
+- Prevents memory exhaustion on folders with many large files
+- Maintains parallelism while controlling memory usage
+
+### Progress Tracking
+
+Multi-progress bar visualization using [mpb/v8](https://github.com/vbauerster/mpb):
+- Individual progress bar per file being compressed
+- Overall progress bar showing total completion
+- Bars auto-remove on completion for clean output
 
 ## Library Usage
 
@@ -160,13 +200,14 @@ result, err := compress.Compress(opts, progressCb)
 #### `compress.Options`
 ```go
 type Options struct {
-    InputPath  string  // Source file/directory
-    OutputPath string  // Output archive path
-    MaxThreads int     // Concurrent threads (default: CPU count)
-    Level      int     // Compression level 1-22 (default: 5)
-    DryRun     bool    // Simulate without writing
-    Verbose    bool    // Detailed logging
-    Quiet      bool    // Suppress output
+    InputPath       string  // Source file/directory
+    OutputPath      string  // Output archive path
+    MaxThreads      int     // Concurrent threads (default: CPU count)
+    MaxThreadMemory uint64  // Max memory per thread in bytes (0=unlimited)
+    Level           int     // Compression level 1-22 (default: 5)
+    DryRun          bool    // Simulate without writing
+    Verbose         bool    // Detailed logging
+    Quiet           bool    // Suppress output
 }
 ```
 
@@ -191,7 +232,6 @@ func (r *Result) Success() bool               // Returns true if no errors
 type Options struct {
     InputPath  string  // Input archive file
     OutputPath string  // Output directory (default: ".")
-    MaxThreads int     // Concurrent threads (currently unused, sequential)
     Overwrite  bool    // Overwrite existing files
     Verbose    bool    // Detailed logging
     Quiet      bool    // Suppress output
@@ -290,6 +330,11 @@ The project uses GitHub Actions for continuous integration:
 Workflow file: [.github/workflows/build-and-release.yml](.github/workflows/build-and-release.yml)
 
 ## Roadmap
+
+Completed:
+- [x] Folder-based parallel compression with true concurrency
+- [x] Memory-aware processing with configurable per-thread limits
+- [x] Multi-progress bar visualization
 
 Future planned features:
 - [ ] Content-based deduplication across files

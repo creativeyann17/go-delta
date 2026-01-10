@@ -20,6 +20,17 @@ type fileTask struct {
 	OrigSize uint64
 }
 
+type folderTask struct {
+	FolderPath string     // Relative folder path
+	Files      []fileTask // Files in this folder
+}
+
+type compressedFile struct {
+	RelPath        string
+	OrigSize       uint64
+	CompressedData []byte
+}
+
 // ProgressCallback is called for various progress events
 type ProgressCallback func(event ProgressEvent)
 
@@ -54,9 +65,10 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 
 	result := &Result{}
 
-	// Collect all files to process
-	filesToCompress := make([]fileTask, 0, 1024)
+	// Collect all files grouped by folder
+	folderMap := make(map[string][]fileTask)
 	var totalOrigSize uint64
+	var totalFiles int
 
 	walkErr := filepath.Walk(opts.InputPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -72,14 +84,22 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 			relPath = path
 		}
 
-		filesToCompress = append(filesToCompress, fileTask{
+		// Group by immediate parent folder
+		folderPath := filepath.Dir(relPath)
+		if folderPath == "." {
+			folderPath = "" // Root level files
+		}
+
+		task := fileTask{
 			AbsPath:  path,
 			RelPath:  relPath,
 			Info:     info,
 			OrigSize: uint64(info.Size()),
-		})
+		}
 
+		folderMap[folderPath] = append(folderMap[folderPath], task)
 		totalOrigSize += uint64(info.Size())
+		totalFiles++
 		return nil
 	})
 
@@ -87,17 +107,26 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		return nil, fmt.Errorf("directory walk failed: %w", walkErr)
 	}
 
-	if len(filesToCompress) == 0 {
+	if totalFiles == 0 {
 		return nil, ErrNoFiles
 	}
 
-	result.FilesTotal = len(filesToCompress)
+	// Convert folder map to task list
+	foldersToCompress := make([]folderTask, 0, len(folderMap))
+	for folderPath, files := range folderMap {
+		foldersToCompress = append(foldersToCompress, folderTask{
+			FolderPath: folderPath,
+			Files:      files,
+		})
+	}
+
+	result.FilesTotal = totalFiles
 	result.OriginalSize = totalOrigSize
 
 	if progressCb != nil {
 		progressCb(ProgressEvent{
 			Type:       EventStart,
-			Total:      int64(len(filesToCompress)),
+			Total:      int64(totalFiles),
 			TotalBytes: totalOrigSize,
 		})
 	}
@@ -116,108 +145,158 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		writer = outFile
 
 		// Write archive header
-		if err := format.WriteArchiveHeader(writer, uint32(len(filesToCompress))); err != nil {
+		if err := format.WriteArchiveHeader(writer, uint32(totalFiles)); err != nil {
 			return nil, fmt.Errorf("write archive header: %w", err)
 		}
 	}
 
-	// Process files with worker pool
+	// Process folders with worker pool
 	var totalComprSize uint64
 	var processedCount atomic.Uint32
 	var errorsMu sync.Mutex
 
 	var wg sync.WaitGroup
-	taskCh := make(chan fileTask, len(filesToCompress))
+	folderCh := make(chan folderTask, len(foldersToCompress))
 
 	for i := 0; i < opts.MaxThreads; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for task := range taskCh {
-				if progressCb != nil {
-					progressCb(ProgressEvent{
-						Type:     EventFileStart,
-						FilePath: task.RelPath,
-						Total:    int64(task.OrigSize),
-					})
+
+			// Helper function to flush compressed files to disk
+			flushToDisk := func(files []compressedFile) error {
+				if len(files) == 0 {
+					return nil
 				}
 
-				var comprSize uint64
-				var err error
+				writerMu.Lock()
+				defer writerMu.Unlock()
 
-				if opts.DryRun {
-					// Dry-run mode (no writer)
-					comprSize, err = compressFile(task, nil, opts.Level, opts.Verbose, progressCb)
-				} else {
-					// Real mode: write file entry header, compress data, update entry
-					// Serialize archive writes to maintain correct data offsets
-					var entryStart int64
-					var dataStart int64
-
-					writerMu.Lock()
+				for _, cf := range files {
 					// Write file entry header
-					entryStart, err = format.WriteFileEntry(writer, task.RelPath, task.OrigSize)
-					if err == nil {
-						// Get current position as data offset
-						dataStart, err = writer.Seek(0, io.SeekCurrent)
+					entryStart, err := format.WriteFileEntry(writer, cf.RelPath, cf.OrigSize)
+					if err != nil {
+						errorsMu.Lock()
+						result.Errors = append(result.Errors, fmt.Errorf("%s: write entry: %w", cf.RelPath, err))
+						errorsMu.Unlock()
+						continue
 					}
-					if err == nil {
-						// Compress and write data immediately while holding lock
-						comprSize, err = compressFile(task, writer, opts.Level, opts.Verbose, progressCb)
+
+					// Get data offset
+					dataStart, err := writer.Seek(0, io.SeekCurrent)
+					if err != nil {
+						errorsMu.Lock()
+						result.Errors = append(result.Errors, fmt.Errorf("%s: seek: %w", cf.RelPath, err))
+						errorsMu.Unlock()
+						continue
 					}
-					if err == nil {
-						// Update file entry with actual compressed size and data offset
-						err = format.UpdateFileEntry(writer, entryStart, comprSize, uint64(dataStart))
+
+					// Write compressed data
+					_, err = writer.Write(cf.CompressedData)
+					if err != nil {
+						errorsMu.Lock()
+						result.Errors = append(result.Errors, fmt.Errorf("%s: write data: %w", cf.RelPath, err))
+						errorsMu.Unlock()
+						continue
 					}
-					writerMu.Unlock()
+
+					// Update entry with compressed size and offset
+					err = format.UpdateFileEntry(writer, entryStart, uint64(len(cf.CompressedData)), uint64(dataStart))
+					if err != nil {
+						errorsMu.Lock()
+						result.Errors = append(result.Errors, fmt.Errorf("%s: update entry: %w", cf.RelPath, err))
+						errorsMu.Unlock()
+					}
+				}
+				return nil
+			}
+
+			for folderTask := range folderCh {
+				// Compress all files in this folder to memory (parallel work)
+				compressedFiles := make([]compressedFile, 0, len(folderTask.Files))
+				var folderComprSize uint64
+
+				for _, fileTask := range folderTask.Files {
+					if progressCb != nil {
+						progressCb(ProgressEvent{
+							Type:     EventFileStart,
+							FilePath: fileTask.RelPath,
+							Total:    int64(fileTask.OrigSize),
+						})
+					}
+
+					var compressedData []byte
+					var err error
+
+					if opts.DryRun {
+						// Dry-run mode: just compress to discard
+						_, err = compressFileToWriter(fileTask, io.Discard, opts.Level, progressCb)
+					} else {
+						// Compress to memory buffer
+						compressedData, err = compressFileToMemory(fileTask, opts.Level, progressCb)
+					}
 
 					if err != nil {
 						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", fileTask.RelPath, err))
 						errorsMu.Unlock()
 						if progressCb != nil {
 							progressCb(ProgressEvent{
 								Type:     EventError,
-								FilePath: task.RelPath,
+								FilePath: fileTask.RelPath,
 							})
 						}
 						continue
 					}
-				}
 
-				if err != nil {
-					errorsMu.Lock()
-					result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
-					errorsMu.Unlock()
-					if progressCb != nil {
-						progressCb(ProgressEvent{
-							Type:     EventError,
-							FilePath: task.RelPath,
+					if !opts.DryRun {
+						compressedFiles = append(compressedFiles, compressedFile{
+							RelPath:        fileTask.RelPath,
+							OrigSize:       fileTask.OrigSize,
+							CompressedData: compressedData,
 						})
+						folderComprSize += uint64(len(compressedData))
+
+						// Check if we should flush due to memory threshold
+						if opts.MaxThreadMemory > 0 && folderComprSize >= opts.MaxThreadMemory {
+							// Flush current batch to disk
+							flushToDisk(compressedFiles)
+							atomic.AddUint64(&totalComprSize, folderComprSize)
+
+							// Reset batch
+							compressedFiles = make([]compressedFile, 0, len(folderTask.Files))
+							folderComprSize = 0
+						}
 					}
-				} else {
-					atomic.AddUint64(&totalComprSize, comprSize)
+
 					processedCount.Add(1)
 					if progressCb != nil {
 						progressCb(ProgressEvent{
 							Type:           EventFileComplete,
-							FilePath:       task.RelPath,
-							Current:        int64(task.OrigSize),
-							Total:          int64(task.OrigSize),
-							CompressedSize: comprSize,
+							FilePath:       fileTask.RelPath,
+							Current:        int64(fileTask.OrigSize),
+							Total:          int64(fileTask.OrigSize),
+							CompressedSize: uint64(len(compressedData)),
 						})
 					}
 				}
+
+				// Final flush for remaining files in this folder
+				if !opts.DryRun && len(compressedFiles) > 0 {
+					flushToDisk(compressedFiles)
+				}
+
+				atomic.AddUint64(&totalComprSize, folderComprSize)
 			}
 		}(i + 1)
 	}
 
-	// Feed tasks
+	// Feed folder tasks
 	go func() {
-		for _, task := range filesToCompress {
-			taskCh <- task
+		for _, task := range foldersToCompress {
+			folderCh <- task
 		}
-		close(taskCh)
+		close(folderCh)
 	}()
 
 	wg.Wait()
@@ -245,38 +324,87 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	return result, nil
 }
 
-// compressFile compresses a single file and returns the number of compressed bytes written.
-func compressFile(
+// compressFileToMemory compresses a file to a memory buffer and returns the compressed data
+func compressFileToMemory(
 	task fileTask,
-	writer io.WriteSeeker,
 	level int,
-	verbose bool,
 	progressCb ProgressCallback,
-) (compressedSize uint64, err error) {
+) ([]byte, error) {
+	src, err := os.Open(task.AbsPath)
+	if err != nil {
+		return nil, fmt.Errorf("open source file: %w", err)
+	}
+	defer src.Close()
+
+	// Create buffer to hold compressed data
+	var buf []byte
+	bufWriter := &bytesWriter{data: &buf}
+
+	// Create zstd encoder
+	enc, err := zstd.NewWriter(bufWriter,
+		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
+		zstd.WithZeroFrames(true),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create zstd writer: %w", err)
+	}
+
+	// Progress tracking reader
+	uncompressedRead := uint64(0)
+	proxy := &progressReader{
+		Reader: src,
+		onRead: func(n int) {
+			uncompressedRead += uint64(n)
+			if progressCb != nil {
+				progressCb(ProgressEvent{
+					Type:         EventFileProgress,
+					FilePath:     task.RelPath,
+					Current:      int64(uncompressedRead),
+					Total:        int64(task.OrigSize),
+					CurrentBytes: uncompressedRead,
+				})
+			}
+		},
+	}
+
+	// Perform compression
+	_, err = io.Copy(enc, proxy)
+	if err != nil {
+		enc.Close()
+		return nil, fmt.Errorf("copy/compress failed: %w", err)
+	}
+
+	// Flush and close encoder
+	if err = enc.Close(); err != nil {
+		return nil, fmt.Errorf("close zstd encoder: %w", err)
+	}
+
+	return buf, nil
+}
+
+// compressFileToWriter compresses a file directly to a writer (for dry-run mode)
+func compressFileToWriter(
+	task fileTask,
+	writer io.Writer,
+	level int,
+	progressCb ProgressCallback,
+) (uint64, error) {
 	src, err := os.Open(task.AbsPath)
 	if err != nil {
 		return 0, fmt.Errorf("open source file: %w", err)
 	}
 	defer src.Close()
 
-	// Determine target writer based on mode
-	var targetWriter io.Writer
-	var compressedBytes uint64 // Track actual compressed bytes written
-
-	if writer == nil {
-		// Dry-run mode: discard output
-		targetWriter = io.Discard
-	} else {
-		// Real mode: wrap writer to track compressed bytes
-		targetWriter = &progressWriter{
-			Writer: writer,
-			onWrite: func(n int) {
-				compressedBytes += uint64(n)
-			},
-		}
+	// Track compressed bytes
+	var compressedBytes uint64
+	targetWriter := &progressWriter{
+		Writer: writer,
+		onWrite: func(n int) {
+			compressedBytes += uint64(n)
+		},
 	}
 
-	// Create zstd encoder with requested level
+	// Create zstd encoder
 	enc, err := zstd.NewWriter(targetWriter,
 		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
 		zstd.WithZeroFrames(true),
@@ -285,7 +413,7 @@ func compressFile(
 		return 0, fmt.Errorf("create zstd writer: %w", err)
 	}
 
-	// Progress tracking reader (for source file progress, not compressed size)
+	// Progress tracking reader
 	uncompressedRead := uint64(0)
 	proxy := &progressReader{
 		Reader: src,
@@ -316,6 +444,15 @@ func compressFile(
 	}
 
 	return compressedBytes, nil
+}
+
+type bytesWriter struct {
+	data *[]byte
+}
+
+func (bw *bytesWriter) Write(p []byte) (n int, err error) {
+	*bw.data = append(*bw.data, p...)
+	return len(p), nil
 }
 
 type progressWriter struct {
