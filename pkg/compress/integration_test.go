@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yourusername/go-delta/pkg/compress"
-	"github.com/yourusername/go-delta/pkg/decompress"
+	"github.com/creativeyann17/go-delta/pkg/compress"
+	"github.com/creativeyann17/go-delta/pkg/decompress"
 )
 
 // TestRoundTrip tests complete compress/decompress cycle

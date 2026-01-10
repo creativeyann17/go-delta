@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/yourusername/go-delta/pkg/compress"
+	"github.com/creativeyann17/go-delta/pkg/compress"
 )
 
 func main() {

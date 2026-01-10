@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/creativeyann17/go-delta/internal/format"
 	"github.com/klauspost/compress/zstd"
-	"github.com/yourusername/go-delta/internal/format"
 )
 
 type fileTask struct {

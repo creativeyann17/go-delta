@@ -26,23 +26,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-
-func init() {
-	// Will add subcommands later: compress, decompress, stats, etc.
-	rootCmd.AddCommand(
-		versionCmd(),
-		compressCmd(),
-		// decompressCmd(),    // ← will be added later
-		// statsCmd(),         // ← optional later
-	)
-}
-
-func versionCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "version",
-		Short: "Show version information",
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("go-delta %s\ncommit: %s\nbuilt: %s\n", version, commit, date)
-		},
-	}
-}

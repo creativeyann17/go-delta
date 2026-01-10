@@ -10,7 +10,7 @@ import (
 	"github.com/cheggaaa/pb/v3"
 	"github.com/spf13/cobra"
 
-	"github.com/yourusername/go-delta/pkg/decompress"
+	"github.com/creativeyann17/go-delta/pkg/decompress"
 )
 
 func init() {

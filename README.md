@@ -16,7 +16,7 @@ A smart delta compression tool for backups written in Go.
 ### From source
 
 ```bash
-git clone https://github.com/yourusername/go-delta.git
+git clone https://github.com/creativeyann17/go-delta.git
 cd go-delta
 make build
 ```
@@ -71,8 +71,6 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 
 ### Compress Options
 
-### Compress Options
-
 - `-i, --input`: Input file or directory (required)
 - `-o, --output`: Output archive file (default: "archive.delta")
 - `-t, --threads`: Max concurrent threads (default: CPU count)
@@ -109,7 +107,7 @@ package main
 import (
     "fmt"
     "log"
-    "github.com/yourusername/go-delta/pkg/compress"
+    "github.com/creativeyann17/go-delta/pkg/compress"
 )
 
 func main() {
@@ -119,22 +117,31 @@ func main() {
         Level:      5,
         MaxThreads: 4,
     }
-    
+
     result, err := compress.Compress(opts, nil)
     if err != nil {
         log.Fatal(err)
     }
-    
-    fmt.Printf("Compressed %d files: %.2f MB → %.2f MB (%.1f%%)\n", 
+
+    fmt.Printf("Compressed %d files: %.2f MB -> %.2f MB (%.1f%%)\n",
         result.FilesProcessed,
         float64(result.OriginalSize)/1024/1024,
         float64(result.CompressedSize)/1024/1024,
-        result.CompressionRStart:
+        result.CompressionRatio())
+}
+```
+
+### With Progress Callback
+
+```go
+progressCb := func(event compress.ProgressEvent) {
+    switch event.Type {
+    case compress.EventFileStart:
         fmt.Printf("Compressing %s...\n", event.FilePath)
     case compress.EventFileComplete:
-        fmt.Printf("✓ %s\n", event.FilePath)
+        fmt.Printf("Done: %s\n", event.FilePath)
     case compress.EventComplete:
-        fmt.Printf("Done: %d files\n", event.Current)
+        fmt.Printf("Completed: %d files\n", event.Current)
     }
 }
 
@@ -202,51 +209,7 @@ type Result struct {
 Both compress and decompress operations return two types of errors:
 
 1. **Fatal errors** - Returned as `error` (operation cannot continue)
-2. **Non-fatal errors** - Collected in `result.Errors` (operation continues)current compression threads
-    Level          int           // Compression level (1-22)
-    DryRun         bool          // Simulate without writing
-    Verbose        bool          // Detailed logging
-    Quiet          bool          // Suppress output
-    ProgressWriter io.Writer     // Custom progress output
-}
-```
-
-#### `compress.Result`
-Statistics from compression operation.
-
-```go
-type Result struct {
-    FilesTotal     int      // Total files found
-    FilesProcessed int      // Successfully compressed
-    OriginalSize   uint64   // Total original bytes
-    CompressedSize uint64   // Total compressed bytes
-    Errors         []error  // Non-fatal errors
-}
-
-// Methods
-func (r *Result) CompressionRatio() float64
-func (r *Result) Success() bool
-```
-
-#### `compress.ProgressEvent`
-Progress notifications during compression.
-
-```go
-type ProgressEvent struct {
-    Type           EventType
-    FilePath       string
-    Current        int64
-    Total          int64
-    CurrentBytes   uint64
-    TotalBytes     uint64
-    CompressedSize uint64
-}
-```
-
-### Functions
-
-#### `compress.Compress(opts *Options, progressCb ProgressCallback) (*Result, error)`
-Main compression function.
+2. **Non-fatal errors** - Collected in `result.Errors` (operation continues)
 
 Common non-fatal errors:
 - `decompress.ErrFileExists` - File already exists (use `--overwrite`)
@@ -256,7 +219,7 @@ Common non-fatal errors:
 ### Build
 
 ```bash
-make build          # Build for current platform → bin/godelta
+make build          # Build for current platform -> bin/godelta
 make build-all      # Cross-compile for linux/darwin/windows
 make clean          # Remove build artifacts
 ```
@@ -325,14 +288,12 @@ Workflow file: [.github/workflows/build-and-release.yml](.github/workflows/build
 
 Future planned features:
 - [ ] Content-based deduplication across files
-- [ ] Delta encoding between file versions  
+- [ ] Delta encoding between file versions
 - [ ] Incremental backups
 - [ ] Archive integrity verification command
 - [ ] File filtering (include/exclude patterns)
 - [ ] Benchmark suite
 
 ## License
-
-See [LICENSE](LICENSE) file.## License
 
 See [LICENSE](LICENSE) file.

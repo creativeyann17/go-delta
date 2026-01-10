@@ -1,4 +1,4 @@
-module github.com/yourusername/go-delta
+module github.com/creativeyann17/go-delta
 
 go 1.23
 
