@@ -1,0 +1,68 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Run tests
+        run: make test
+
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    needs: test  # Only build if tests pass
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build all platforms
+        run: make build-all
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: build  # Only release if build succeeds
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build all platforms
+        run: make build-all
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
