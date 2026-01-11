@@ -458,8 +458,8 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 
 	// Determine base directory for relative paths
 	if len(opts.Files) > 0 {
-		// Use current working directory as base when Files is provided
-		baseDir, _ = os.Getwd()
+		// Find common base path for all input files/directories
+		baseDir = findCommonBasePath(opts.Files)
 	} else {
 		baseDir = opts.InputPath
 	}
@@ -475,12 +475,28 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 				return nil
 			}
 
+			// Calculate relative path from base directory
 			relPath, err := filepath.Rel(baseDir, path)
 			if err != nil {
-				// If relative path fails, use the path from the input root
+				// If relative path calculation fails, try using path relative to input
 				relPath, err = filepath.Rel(inputPath, path)
 				if err != nil {
+					// As last resort, use just the filename
 					relPath = filepath.Base(path)
+				}
+			}
+
+			// If relPath starts with "..", we're outside the base - use absolute structure
+			// This shouldn't happen with proper common base calculation, but handle it gracefully
+			if len(relPath) >= 2 && relPath[0:2] == ".." {
+				// Strip leading "../" and use the remainder
+				relPath = filepath.Base(inputPath)
+				if info.Name() != filepath.Base(inputPath) {
+					// It's a file inside the input directory
+					subPath, _ := filepath.Rel(inputPath, path)
+					if subPath != "" && subPath != "." {
+						relPath = filepath.Join(relPath, subPath)
+					}
 				}
 			}
 
@@ -529,4 +545,89 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 	}
 
 	return foldersToCompress, totalFiles, totalOrigSize, nil
+}
+
+// findCommonBasePath finds the deepest common directory path for a list of file/directory paths
+func findCommonBasePath(paths []string) string {
+	if len(paths) == 0 {
+		return "."
+	}
+	if len(paths) == 1 {
+		// For single path, use its directory (or itself if it's a directory)
+		absPath, err := filepath.Abs(paths[0])
+		if err != nil {
+			return filepath.Dir(paths[0])
+		}
+		info, err := os.Stat(absPath)
+		if err != nil || !info.IsDir() {
+			return filepath.Dir(absPath)
+		}
+		return absPath
+	}
+
+	// Convert all paths to absolute and clean them
+	absPaths := make([]string, len(paths))
+	for i, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		absPaths[i] = filepath.Clean(abs)
+	}
+
+	// Split first path into components
+	commonParts := splitPath(absPaths[0])
+
+	// Find common prefix with all other paths
+	for _, path := range absPaths[1:] {
+		parts := splitPath(path)
+
+		// Find where they diverge
+		minLen := len(commonParts)
+		if len(parts) < minLen {
+			minLen = len(parts)
+		}
+
+		divergeAt := 0
+		for i := 0; i < minLen; i++ {
+			if commonParts[i] != parts[i] {
+				break
+			}
+			divergeAt = i + 1
+		}
+
+		commonParts = commonParts[:divergeAt]
+		if len(commonParts) == 0 {
+			break
+		}
+	}
+
+	// Reconstruct path from common parts
+	if len(commonParts) == 0 {
+		return "."
+	}
+
+	return filepath.Join(commonParts...)
+}
+
+// splitPath splits a path into its directory components
+func splitPath(path string) []string {
+	path = filepath.Clean(path)
+	var parts []string
+
+	for {
+		dir, file := filepath.Split(path)
+		if file != "" {
+			parts = append([]string{file}, parts...)
+		}
+		if dir == "" || dir == "/" || dir == "." {
+			if dir == "/" {
+				parts = append([]string{"/"}, parts...)
+			}
+			break
+		}
+		path = filepath.Clean(dir)
+	}
+
+	return parts
 }

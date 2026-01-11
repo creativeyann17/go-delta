@@ -1,0 +1,52 @@
+// Example: Compressing files from outside the current working directory
+// This demonstrates using the Files option to compress files from different locations
+
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/creativeyann17/go-delta/pkg/compress"
+)
+
+func main() {
+	// Example: Compress files from various locations
+	// The common base path will be automatically determined
+	opts := &compress.Options{
+		Files: []string{
+			"/var/log/app.log",           // Absolute path to a file
+			"/home/user/documents",       // Absolute path to a directory
+			"/tmp/data/file.txt",         // Another absolute path
+			"./local/config.json",        // Relative path from current directory
+		},
+		OutputPath: "backup.delta",
+		MaxThreads: 4,
+		Level:      9,
+		Verbose:    true,
+	}
+
+	result, err := compress.Compress(opts, nil)
+	if err != nil {
+		log.Fatalf("Compression failed: %v", err)
+	}
+
+	fmt.Printf("\nCompression completed!\n")
+	fmt.Printf("Files processed: %d/%d\n", result.FilesProcessed, result.FilesTotal)
+	fmt.Printf("Original size: %.2f MB\n", float64(result.OriginalSize)/1024/1024)
+	fmt.Printf("Compressed size: %.2f MB\n", float64(result.CompressedSize)/1024/1024)
+	fmt.Printf("Compression ratio: %.1f%%\n", result.CompressionRatio())
+
+	if !result.Success() {
+		fmt.Printf("\nErrors encountered: %d\n", len(result.Errors))
+		for _, e := range result.Errors {
+			fmt.Printf("  - %v\n", e)
+		}
+	}
+
+	// Note: Files will be stored with relative paths based on their common base directory
+	// For example:
+	// - /tmp/dir1/file.txt and /tmp/dir2/file.txt will have common base /tmp
+	//   and be stored as: dir1/file.txt and dir2/file.txt
+	// - Files with no common parent will use directory names as the base
+}

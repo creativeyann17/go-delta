@@ -433,3 +433,245 @@ func TestDecompressTwice(t *testing.T) {
 
 	t.Log("✓ Third decompression with overwrite succeeded")
 }
+
+// TestCustomFilesOutsideWorkingDir tests using Files option with files outside current working directory
+func TestCustomFilesOutsideWorkingDir(t *testing.T) {
+	// Create test structure:
+	// /tmp/dir1/file1.txt
+	// /tmp/dir2/subdir/file2.txt
+	// /tmp/dir3/file3.txt
+	// We'll run the test from /tmp/workdir (different from the files)
+
+	workDir := t.TempDir() // /tmp/.../workdir
+	dir1 := t.TempDir()    // /tmp/.../dir1
+	dir2 := t.TempDir()    // /tmp/.../dir2
+	dir3 := t.TempDir()    // /tmp/.../dir3
+	archivePath := filepath.Join(workDir, "test.delta")
+	destDir := t.TempDir()
+
+	// Create test files in different directories
+	file1Path := filepath.Join(dir1, "file1.txt")
+	file2Path := filepath.Join(dir2, "subdir", "file2.txt")
+	file3Path := filepath.Join(dir3, "file3.txt")
+
+	if err := os.WriteFile(file1Path, []byte("content1"), 0644); err != nil {
+		t.Fatalf("Failed to create file1: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(file2Path), 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+	if err := os.WriteFile(file2Path, []byte("content2"), 0644); err != nil {
+		t.Fatalf("Failed to create file2: %v", err)
+	}
+	if err := os.WriteFile(file3Path, []byte("content3"), 0644); err != nil {
+		t.Fatalf("Failed to create file3: %v", err)
+	}
+
+	// Change to workDir (different from file locations)
+	originalWd, _ := os.Getwd()
+	defer os.Chdir(originalWd)
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatalf("Failed to change to work dir: %v", err)
+	}
+
+	// Test compression with Files option
+	t.Run("Compress", func(t *testing.T) {
+		opts := &compress.Options{
+			Files: []string{
+				file1Path,
+				file2Path,
+				dir3, // entire directory
+			},
+			OutputPath: archivePath,
+			Level:      5,
+			MaxThreads: 2,
+			Verbose:    true,
+			Quiet:      false,
+			DryRun:     false,
+		}
+
+		if err := opts.Validate(); err != nil {
+			t.Fatalf("Invalid compress options: %v", err)
+		}
+
+		result, err := compress.Compress(opts, nil)
+		if err != nil {
+			t.Fatalf("Compression failed: %v", err)
+		}
+
+		if result.FilesProcessed != 3 {
+			t.Errorf("Expected 3 files compressed, got %d", result.FilesProcessed)
+		}
+
+		if len(result.Errors) > 0 {
+			t.Errorf("Compression had errors: %v", result.Errors)
+		}
+
+		t.Logf("Compressed %d files from custom list", result.FilesProcessed)
+	})
+
+	// Test decompression
+	t.Run("Decompress", func(t *testing.T) {
+		opts := &decompress.Options{
+			InputPath:  archivePath,
+			OutputPath: destDir,
+			MaxThreads: 2,
+			Verbose:    true,
+			Quiet:      false,
+			Overwrite:  false,
+		}
+
+		if err := opts.Validate(); err != nil {
+			t.Fatalf("Invalid decompress options: %v", err)
+		}
+
+		result, err := decompress.Decompress(opts, nil)
+		if err != nil {
+			t.Fatalf("Decompression failed: %v", err)
+		}
+
+		if result.FilesProcessed != 3 {
+			t.Errorf("Expected 3 files decompressed, got %d", result.FilesProcessed)
+		}
+
+		if len(result.Errors) > 0 {
+			t.Errorf("Decompression had errors: %v", result.Errors)
+		}
+	})
+
+	// Verify decompressed files
+	t.Run("Verify", func(t *testing.T) {
+		// Check that files were decompressed with proper paths
+		// The relative paths should be meaningful, not "." or empty
+
+		// List all files in destDir recursively
+		var extractedFiles []string
+		err := filepath.Walk(destDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			rel, _ := filepath.Rel(destDir, path)
+			extractedFiles = append(extractedFiles, rel)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to walk destination directory: %v", err)
+		}
+
+		t.Logf("Extracted files: %v", extractedFiles)
+
+		// Verify we have 3 files
+		if len(extractedFiles) != 3 {
+			t.Errorf("Expected 3 extracted files, got %d: %v", len(extractedFiles), extractedFiles)
+		}
+
+		// Verify none of the paths are "." or empty
+		for _, path := range extractedFiles {
+			if path == "." || path == "" {
+				t.Errorf("Found invalid path in archive: %q (should have meaningful relative path)", path)
+			}
+		}
+
+		// Verify content of files
+		foundFiles := make(map[string]bool)
+		for _, path := range extractedFiles {
+			fullPath := filepath.Join(destDir, path)
+			content, err := os.ReadFile(fullPath)
+			if err != nil {
+				t.Errorf("Failed to read %s: %v", path, err)
+				continue
+			}
+			contentStr := string(content)
+			if contentStr == "content1" {
+				foundFiles["file1"] = true
+			} else if contentStr == "content2" {
+				foundFiles["file2"] = true
+			} else if contentStr == "content3" {
+				foundFiles["file3"] = true
+			}
+		}
+
+		if len(foundFiles) != 3 {
+			t.Errorf("Not all file contents were found correctly: %v", foundFiles)
+		}
+	})
+}
+
+// TestCustomFilesNoCommonBase tests Files option with files that have no common parent
+func TestCustomFilesNoCommonBase(t *testing.T) {
+	// Test edge case: files with minimal common base (e.g., just "/" on Unix)
+	// This verifies that even in extreme cases, we get valid relative paths
+
+	workDir := t.TempDir()
+	archivePath := filepath.Join(workDir, "test.delta")
+	destDir := t.TempDir()
+
+	// Create files in separate temp directories (no common parent except root)
+	file1 := filepath.Join(t.TempDir(), "file1.txt")
+	file2 := filepath.Join(t.TempDir(), "file2.txt")
+
+	if err := os.WriteFile(file1, []byte("content1"), 0644); err != nil {
+		t.Fatalf("Failed to create file1: %v", err)
+	}
+	if err := os.WriteFile(file2, []byte("content2"), 0644); err != nil {
+		t.Fatalf("Failed to create file2: %v", err)
+	}
+
+	// Compress with Files option
+	opts := &compress.Options{
+		Files:      []string{file1, file2},
+		OutputPath: archivePath,
+		Level:      5,
+		MaxThreads: 2,
+	}
+
+	result, err := compress.Compress(opts, nil)
+	if err != nil {
+		t.Fatalf("Compression failed: %v", err)
+	}
+
+	if result.FilesProcessed != 2 {
+		t.Errorf("Expected 2 files compressed, got %d", result.FilesProcessed)
+	}
+
+	// Decompress
+	decOpts := &decompress.Options{
+		InputPath:  archivePath,
+		OutputPath: destDir,
+	}
+
+	decResult, err := decompress.Decompress(decOpts, nil)
+	if err != nil {
+		t.Fatalf("Decompression failed: %v", err)
+	}
+
+	if decResult.FilesProcessed != 2 {
+		t.Errorf("Expected 2 files decompressed, got %d", decResult.FilesProcessed)
+	}
+
+	// Verify extracted files have valid paths (not "." or empty)
+	var extractedFiles []string
+	err = filepath.Walk(destDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(destDir, path)
+		extractedFiles = append(extractedFiles, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to walk destination: %v", err)
+	}
+
+	t.Logf("Extracted files: %v", extractedFiles)
+
+	for _, path := range extractedFiles {
+		if path == "." || path == "" {
+			t.Errorf("Found invalid path: %q", path)
+		}
+	}
+
+	if len(extractedFiles) != 2 {
+		t.Errorf("Expected 2 extracted files, got %d", len(extractedFiles))
+	}
+}
