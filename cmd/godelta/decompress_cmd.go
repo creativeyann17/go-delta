@@ -28,9 +28,24 @@ func decompressCmd() *cobra.Command {
 		Use:   "decompress",
 		Short: "Decompress delta archive to files",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Add .gdelta extension if missing
-			if inputPath != "" && len(inputPath) >= 7 && inputPath[len(inputPath)-7:] != ".gdelta" {
-				inputPath += ".gdelta"
+			// Add extension if missing
+			if inputPath != "" {
+				hasZip := len(inputPath) >= 4 && inputPath[len(inputPath)-4:] == ".zip"
+				hasGdelta := len(inputPath) >= 7 && inputPath[len(inputPath)-7:] == ".gdelta"
+
+				if !hasZip && !hasGdelta {
+					// Check for multi-part ZIP first (e.g., archive_01.zip)
+					multiPartZip := inputPath + "_01.zip"
+					if _, err := os.Stat(multiPartZip); err == nil {
+						inputPath = multiPartZip
+					} else if _, err := os.Stat(inputPath + ".zip"); err == nil {
+						// Check for single ZIP file
+						inputPath += ".zip"
+					} else {
+						// Default to .gdelta
+						inputPath += ".gdelta"
+					}
+				}
 			}
 
 			// Prepare options
@@ -65,7 +80,8 @@ func decompressCmd() *cobra.Command {
 			// Multi-progress bar container
 			var progress *mpb.Progress
 			var overallBar *mpb.Bar
-			var fileBars sync.Map // map[string]*mpb.Bar
+			var fileBars sync.Map     // map[string]*mpb.Bar
+			var showFileProgress bool // Only show per-file bars for small archives
 
 			if !quiet && !verbose {
 				progress = mpb.New(
@@ -82,6 +98,9 @@ func decompressCmd() *cobra.Command {
 
 				switch event.Type {
 				case decompress.EventStart:
+					// Only show per-file progress for smaller archives (<1000 files)
+					showFileProgress = event.Total < 1000
+
 					// Create overall progress bar (at bottom via priority)
 					overallBar = progress.AddBar(event.Total,
 						mpb.PrependDecorators(
@@ -95,6 +114,9 @@ func decompressCmd() *cobra.Command {
 					)
 
 				case decompress.EventFileStart:
+					if !showFileProgress {
+						return // Skip per-file bars for large archives
+					}
 					// Create a bar for this file
 					shortName := truncateLeft(event.FilePath, 30)
 					bar := progress.AddBar(event.Total,
@@ -102,7 +124,7 @@ func decompressCmd() *cobra.Command {
 							decor.Name(shortName, decor.WC{C: decor.DindentRight | decor.DextraSpace, W: 32}),
 						),
 						mpb.AppendDecorators(
-							decor.CountersKibiByte("% .1f / % .1f", decor.WCSyncWidth),
+							decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 18}),
 							decor.Percentage(decor.WC{W: 5}),
 						),
 						mpb.BarRemoveOnComplete(),

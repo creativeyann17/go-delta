@@ -34,10 +34,16 @@ type Options struct {
 	// Default: 0
 	ChunkStoreSize uint64
 
-	// Compression level (1-22 for zstd)
-	// 1=fastest, 9=balanced, 19+=maximum compression
+	// Compression level (1-22 for zstd, 1-9 for zip deflate)
+	// 1=fastest, 9=balanced, 19+=maximum compression (zstd only)
 	// Default: 5
 	Level int
+
+	// UseZipFormat creates a standard ZIP archive instead of GDELTA format
+	// Uses Deflate compression (universally compatible)
+	// Cannot be combined with ChunkSize (deduplication not supported in ZIP mode)
+	// Default: false
+	UseZipFormat bool
 
 	// DryRun simulates compression without writing
 	DryRun bool
@@ -77,8 +83,25 @@ func (o *Options) Validate() error {
 	if o.MaxThreads <= 0 {
 		o.MaxThreads = runtime.NumCPU()
 	}
-	if o.Level < 1 || o.Level > 22 {
-		return ErrInvalidLevel
+
+	// Set default level if not specified
+	if o.Level == 0 {
+		o.Level = 5
+	}
+
+	// ZIP mode uses deflate compression (1-9 levels)
+	if o.UseZipFormat {
+		if o.Level < 1 || o.Level > 9 {
+			return ErrInvalidLevel
+		}
+		if o.ChunkSize > 0 {
+			return ErrZipNoChunking
+		}
+	} else {
+		// GDELTA mode uses zstd (1-22 levels)
+		if o.Level < 1 || o.Level > 22 {
+			return ErrInvalidLevel
+		}
 	}
 	if o.Quiet {
 		o.Verbose = false

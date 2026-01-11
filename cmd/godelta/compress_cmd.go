@@ -32,14 +32,26 @@ func compressCmd() *cobra.Command {
 	var verbose bool
 	var quiet bool
 	var compressLevel int
+	var useZipFormat bool
 
 	cmd := &cobra.Command{
 		Use:   "compress",
 		Short: "Compress file or directory into delta archive",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Add .gdelta extension if missing
-			if outputPath != "" && len(outputPath) >= 7 && outputPath[len(outputPath)-7:] != ".gdelta" {
-				outputPath += ".gdelta"
+			// Determine output extension based on format
+			if outputPath == "" {
+				outputPath = "archive"
+			}
+			if useZipFormat {
+				// For ZIP, remove .zip if present - compress_zip will add _01.zip, _02.zip, etc.
+				if strings.HasSuffix(outputPath, ".zip") {
+					outputPath = outputPath[:len(outputPath)-4]
+				}
+			} else {
+				// Add .gdelta extension if missing
+				if !strings.HasSuffix(outputPath, ".gdelta") {
+					outputPath += ".gdelta"
+				}
 			}
 
 			// Parse size strings
@@ -122,6 +134,7 @@ func compressCmd() *cobra.Command {
 				ChunkSize:       chunkSizeKB * 1024,      // Convert KB to bytes
 				ChunkStoreSize:  chunkStoreSizeKB / 1024, // Convert KB to MB (ChunkStoreSize is in MB)
 				Level:           compressLevel,
+				UseZipFormat:    useZipFormat,
 				DryRun:          dryRun,
 				Verbose:         verbose,
 				Quiet:           quiet,
@@ -133,11 +146,19 @@ func compressCmd() *cobra.Command {
 			}
 
 			// Warn about very high compression levels
-			if compressLevel >= 15 && !quiet {
+			if !useZipFormat && compressLevel >= 15 && !quiet {
 				fmt.Println("Note: high compression level (>=15) — this will be slow but can give much better ratio")
 			}
 
+			formatType := "GDELTA01"
+			if useZipFormat {
+				formatType = "ZIP"
+			} else if opts.ChunkSize > 0 {
+				formatType = "GDELTA02"
+			}
+
 			log("Starting compression...")
+			log("  Format:      %s", formatType)
 			log("  Input:       %s", opts.InputPath)
 			log("  Output:      %s", opts.OutputPath)
 			log("  Threads:     %d", opts.MaxThreads)
@@ -202,7 +223,7 @@ func compressCmd() *cobra.Command {
 							decor.Name(shortName, decor.WC{C: decor.DindentRight | decor.DextraSpace, W: 32}),
 						),
 						mpb.AppendDecorators(
-							decor.CountersKibiByte("% .1f / % .1f", decor.WCSyncWidth),
+							decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 18}),
 							decor.Percentage(decor.WC{W: 5}),
 						),
 						mpb.BarRemoveOnComplete(),
@@ -301,11 +322,12 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVar(&threadMemoryStr, "thread-memory", "0", "Max memory per thread (e.g. 128MB, 1GB, 0=auto)")
 	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Chunk size for deduplication (e.g. 64KB, 512KB, min: 4KB, 0=disabled)")
 	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=unlimited, does NOT limit archive size)")
+	cmd.Flags().BoolVar(&useZipFormat, "zip", false, "Create standard ZIP archive instead of GDELTA format (universally compatible)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Simulate without writing anything")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Minimal output (overrides verbose)")
 	cmd.Flags().IntVarP(&compressLevel, "level", "l", 5,
-		"zstd compression level (1=fastest, 9=best default, 19=max ratio)")
+		"Compression level: 1-9 for ZIP deflate, 1-22 for zstd (1=fastest, 9=best default, 19=max ratio for zstd)")
 
 	_ = cmd.MarkFlagRequired("input")
 

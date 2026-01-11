@@ -9,12 +9,14 @@ A smart delta compression tool for backups written in Go.
 
 ## Features
 
+- **Multiple compression formats** - GDELTA (custom format with optional deduplication) or standard ZIP (universal compatibility)
 - **Content-based deduplication** - Chunk-level deduplication with BLAKE3 hashing (GDELTA02 format)
 - **Human-readable sizes** - Use `64KB`, `128MB`, `2GB` instead of raw byte counts
 - **Smart memory management** - Auto-calculated thread memory with system RAM detection and safety warnings
 - **Bounded chunk store** - LRU eviction prevents memory exhaustion on large datasets
 - **Minimum chunk size enforcement** - 4KB minimum prevents metadata overhead from exceeding savings
-- **Zstandard compression** - Industry-leading compression with configurable levels (1-22)
+- **Zstandard compression** - Industry-leading compression with configurable levels (1-22) for GDELTA
+- **Deflate compression** - Standard ZIP deflate compression (levels 1-9) for universal compatibility
 - **True parallel compression** - Folder-based worker pool with independent compression (no mutex contention)
 - **Streaming architecture** - Temporary file streaming avoids loading compressed data into RAM
 - **Robust cleanup** - Automatic temp file deletion on normal exit, errors, and interruptions (Ctrl+C)
@@ -92,7 +94,19 @@ godelta compress \
 
 # Dry run to see what would be compressed
 godelta compress -i /data -o test.delta --dry-run
+
+# Create standard ZIP archive (universal compatibility)
+# Multi-threaded ZIP creates multiple archive files for true parallelism
+# Example: --threads 8 creates archive_01.zip through archive_08.zip
+godelta compress \
+  --input /data \
+  --output archive.zip \
+  --zip \
+  --level 9 \
+  --threads 8
 ```
+
+**Note**: ZIP format with multiple threads creates one archive file per thread (e.g., `archive_01.zip`, `archive_02.zip`, etc.) for true parallel compression without mutex contention. Decompression auto-detects and extracts all parts.
 
 ### Decompress files
 
@@ -113,9 +127,10 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 - `-o, --output`: Output archive file (default: "archive.delta")
 - `-t, --threads`: Max concurrent threads (default: CPU count)
 - `--thread-memory`: Max memory per thread (e.g. `128MB`, `1GB`, `0=auto`, default: 0)
-- `-l, --level`: Compression level 1-22 (default: 5)
-- `--chunk-size`: Chunk size for deduplication (e.g. `64KB`, `512KB`, min: `4KB`, `0=disabled`, default: 0)
-- `--chunk-store-size`: Max in-memory dedup cache size (e.g. `1GB`, `500MB`, `0=unlimited`, default: 0)
+- `-l, --level`: Compression level 1-9 for ZIP, 1-22 for GDELTA (default: 5)
+- `--chunk-size`: Chunk size for deduplication (e.g. `64KB`, `512KB`, min: `4KB`, `0=disabled`, default: 0, GDELTA only)
+- `--chunk-store-size`: Max in-memory dedup cache size (e.g. `1GB`, `500MB`, `0=unlimited`, default: 0, GDELTA only)
+- `--zip`: Create standard ZIP archive instead of GDELTA format (universally compatible, no deduplication)
 - `--dry-run`: Simulate without writing
 - `--verbose`: Show detailed output including chunk statistics
 - `--quiet`: Minimal output
@@ -129,21 +144,55 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 
 ### Decompress Options
 
-- `-i, --input`: Input archive file (required, `.gdelta` extension auto-added if missing)
+- `-i, --input`: Input archive file (required, auto-detects `.gdelta` or `.zip` format)
 - `-o, --output`: Output directory (default: current directory)
 - `--overwrite`: Overwrite existing files
 - `--verbose`: Show detailed output
 - `--quiet`: Minimal output
 
+**Note**: Decompression automatically detects the archive format (GDELTA01, GDELTA02, or ZIP) by reading the file signature.
+
 ## Archive Formats
 
+### ZIP (Standard)
+Standard ZIP archive format with deflate compression:
+- **Universal compatibility**: Works with any ZIP tool (unzip, 7zip, WinZip, etc.)
+- **Deflate compression**: Industry-standard compression (levels 1-9)
+- **Multi-part parallel compression**: Each worker thread creates its own ZIP file for true parallelism (no mutex bottleneck)
+- **No deduplication**: Each file compressed independently
+- **Use case**: Maximum portability, sharing archives, integration with existing tools
+
+**Multi-threaded behavior**: When using multiple threads (e.g., `--threads 8`), godelta creates one ZIP file per thread:
+- Single thread: `backup.zip`
+- Multi-threaded: `backup_01.zip`, `backup_02.zip`, ..., `backup_08.zip`
+- Files are distributed evenly across worker ZIPs
+- True parallel writes (no serialization bottleneck)
+- Decompression auto-detects and extracts all parts
+
+**Performance**: Slightly slower than GDELTA01 (deflate vs zstd), but universally compatible.
+
+```bash
+# Create ZIP archive (creates backup_01.zip through backup_08.zip with 8 threads)
+godelta compress -i /data -o backup.zip --zip --level 9 --threads 8
+
+# Extract with godelta (auto-detects all parts)
+godelta decompress -i backup_01.zip -o /restore
+
+# Or extract individual parts with standard tools
+unzip -d /restore backup_01.zip
+unzip -d /restore backup_02.zip
+# ... etc
+```
+
 ### GDELTA01 (Traditional)
-Standard compression without deduplication:
+Custom format with zstandard compression (no deduplication):
 - **Header**: Magic number + file count
 - **Entry metadata**: Path, original size, compressed size, data offset
 - **Compressed data**: Zstandard-compressed file contents
 
 Files are stored sequentially with entry headers followed immediately by compressed data.
+
+**Performance**: Fastest compression, best compression ratio (zstd), no deduplication overhead.
 
 ### GDELTA02 (Chunked with Deduplication)
 Content-based deduplication using fixed-size chunks:
@@ -189,8 +238,11 @@ Content-based deduplication using fixed-size chunks:
 - **NOT recommended for**: Collections of unique compressed files, media libraries, encrypted archives
 
 **Format selection:**
-- Without `--chunk-size`: GDELTA01 (traditional)
-- With `--chunk-size N`: GDELTA02 (chunked deduplication)
+- With `--zip`: ZIP format (deflate compression, universal compatibility)
+- Without `--chunk-size` or `--zip`: GDELTA01 (zstd compression, fastest)
+- With `--chunk-size N`: GDELTA02 (zstd + deduplication)
+
+**Note**: `--zip` and `--chunk-size` cannot be combined (ZIP does not support deduplication).
 
 ## Architecture
 
@@ -409,59 +461,17 @@ make fmt            # Format code with go fmt
 
 The test suite includes:
 - Round-trip compression/decompression with MD5 validation
+- ZIP format with multi-part archive creation and extraction
 - Subdirectory handling
 - Empty file and directory edge cases
 - Overwrite protection
 - Duplicate compression/decompression scenarios
+- Thread safety and parallel processing
 
 ### Git Hooks
 
 ```bash
 make install-hooks  # Install pre-commit hook
-```
-
-Th├── sysmem_linux.go   # Linux system memory detection
-  ├── sysmem_darwin.go  # macOS system memory detection
-  ├── sysmem_windows.go # Windows system memory detection
-  └── version_cmd.go  # Version subcommand
-
-pkg/                  # Public API
-  ├── compress/       # Compression implementation
-  │   ├── compress.go           # Main entry point
-  │   ├── compress_chunked.go   # GDELTA02 chunked compression with streaming
-  │   ├── options.go
-  │   ├── result.go
-  │   └── integration_test.go
-  └── decompress/     # Decompression implementation
-      ├── decompress.go         # Main entry point
-      ├── decompress_chunked.go # GDELTA02 decompression
-      ├── options.go
-      └── result.go
-
-internal/             # Private packages
-  ├── format/         # Archive formats
-  │   ├── archive.go  # GDELTA01 write
-  │   ├── reader.go   # GDELTA01 read
-  │   └── gdelta02.go # GDELTA02 read/write
-  ├── chunker/        # Fixed-size chunking with BLAKE3
-  │   ├── chunker.go
-  │   └── chunker_test.go
-  └── chunkstore/     # Thread-safe deduplication store with bounded LRU
-      ├── store.go
-      ├── store_test.go
-      └── bounded       # Archive formats
-  │   ├── archive.go  # GDELTA01 write
-  │   ├── reader.go   # GDELTA01 read
-  │   └── gdelta02.go # GDELTA02 read/write
-  ├── chunker/        # Fixed-size chunking with BLAKE3
-  │   ├── chunker.go
-  │   └── chunker_test.go
-  └── chunkstore/     # Thread-safe deduplication store
-      ├── store.go
-      └── store_test.go
-
-hooks/               # Git hooks (tracked)
-  └── pre-commit     # Auto-format before commit
 ```
 
 ## CI/CD
@@ -485,35 +495,6 @@ Comprehensive test suite with 35+ tests covering:
 - Concurrent operations
 - Error handling and edge cases
 
-Run tests with:
-```basHuman-readable size parsing (64KB, 128MB, 2GB, etc.)
-- [x] Auto-calculated thread memory with system RAM detection
-- [x] Cross-platform system memory detection (Linux/macOS/Windows)
-- [x] Memory safety warnings when thread allocation exceeds system RAM
-- [x] Minimum chunk size enforcement (4KB) to prevent metadata overhead
-- [x] Automatic temp file cleanup on interruption (Ctrl+C)
-- [x] Correct deduplication statistics (TotalChunks vs UniqueChunks)
-- [x] Comprehensive test suite with 35+ tests including bounded store tests
-
-Future planned features:
-- [ ] Variable-size chunking (content-defined chunking with FastCDC)
-- [ ] Delta encoding between file versions
-- [ ] Incremental backups with change detection
-- [ ] Archive integrity verification command
-- [ ] File filtering (include/exclude patterns)
-- [ ] Encryption support with AES-256-GCM visualization
-- [x] Content-based deduplication with chunk-level hashing (GDELTA02)
-- [x] Bounded chunk store with LRU eviction (prevents OOM)
-- [x] Streaming temp file architecture (avoids loading chunks into RAM)
-- [x] Comprehensive test suite with 35+ tests including bounded store tests
-
-Future planned features:
-- [ ] Variable-size chunking (content-defined chunking)
-- [ ] Delta encoding between file versions
-- [ ] Incremental backups
-- [ ] Archive integrity verification command
-- [ ] File filtering (include/exclude patterns)
-- [ ] Encryption support
 
 ## License
 

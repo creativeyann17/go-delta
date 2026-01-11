@@ -63,7 +63,13 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		return nil, fmt.Errorf("seek to start: %w", err)
 	}
 
-	// Route based on format version
+	// Check if it's a ZIP file (PK signature - can be \x03\x04 for local file header or \x05\x06 for empty ZIP)
+	if magic[0] == 'P' && magic[1] == 'K' {
+		archiveFile.Close() // ZIP reader needs file path, not handle
+		return result, decompressZip(opts, progressCb, result)
+	}
+
+	// Route based on GDELTA format version
 	switch string(magic) {
 	case format.ArchiveMagic02:
 		// GDELTA02 with chunking

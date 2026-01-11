@@ -131,6 +131,11 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		})
 	}
 
+	// Route to ZIP compression if UseZipFormat is enabled
+	if opts.UseZipFormat {
+		return result, compressToZip(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result)
+	}
+
 	// Route to chunked compression if ChunkSize > 0
 	if opts.ChunkSize > 0 {
 		return result, compressWithChunking(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result)

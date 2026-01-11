@@ -83,18 +83,50 @@ Integration tests for GDELTA02 compression and decompression.
   
 - `TestChunkStoreDeduplication`: Direct store behavior testing
   - Creates 2 unique chunks + 1 duplicate
-  - Verifies stats: 2 total, 2 unique, 1 deduped
+  - Verifies stats: 3 total, 2 unique, 1 deduped
   
 - `TestEmptyFileWithChunking`: Edge case for zero-byte files
   - Ensures empty files compress/decompress without errors
+
+### 4. pkg/compress/compress_zip_test.go
+
+Integration tests for ZIP format compression and decompression.
+
+**Tests:**
+- `TestZipCompressDecompress`: Full round-trip compress→decompress cycle
+  - Creates 3 test files with nested subdirectory
+  - Compresses to ZIP format
+  - Decompresses with godelta
+  - Verifies MD5 hashes match original files
+  - Validates ZIP archive can be opened with standard tools
+  
+- `TestZipCompressionLevels`: Compression level effectiveness
+  - Tests levels 1, 5, and 9 with repetitive data (100KB)
+  - Level 1 uses Store method (no compression)
+  - Levels 5 and 9 use deflate compression
+  - Verifies higher levels produce smaller or equal sizes
+  
+- `TestZipDryRun`: Dry-run mode validation
+  - Ensures no output file is created
+  - Stats are still calculated
+  
+- `TestZipWithChunkingShouldFail`: Validation test
+  - Confirms `--zip` and `--chunk-size` cannot be combined
+  - Returns `ErrZipNoChunking` error
+  
+- `TestZipThreadSafety`: Concurrent compression stress test
+  - 100 files compressed with 8 worker threads
+  - Validates thread-safe ZIP writes (mutex-protected)
+  - Verifies all files present in final archive
 
 ## Test Statistics
 
 ### Total Coverage
 - **10 tests** for chunker (+ 2 benchmarks)
 - **14 tests** for chunkstore (+ 5 benchmarks) - includes bounded store tests
-- **6 integration tests** for chunked compress/decompress
-- **Total: 30+ tests + 7 benchmarks**
+- **6 integration tests** for chunked compress/decompress (GDELTA02)
+- **5 integration tests** for ZIP compress/decompress
+- **Total: 35+ tests + 7 benchmarks**
 
 ### Key Scenarios Covered
 ✅ Fixed-size chunking with various data sizes  
@@ -108,6 +140,11 @@ Integration tests for GDELTA02 compression and decompression.
 ✅ Error propagation  
 ✅ Statistics tracking (TotalChunks, UniqueChunks, DedupedChunks, BytesSaved, Evictions)  
 ✅ Performance benchmarks including eviction overhead  
+✅ **ZIP format with deflate compression (levels 1-9)**  
+✅ **ZIP round-trip integrity with MD5 validation**  
+✅ **ZIP thread-safe concurrent writes**  
+✅ **ZIP format validation (--zip + --chunk-size error)**  
+✅ **Auto-detection of archive format (GDELTA vs ZIP)**  
 
 ## Running Tests
 
@@ -137,7 +174,7 @@ All tests should pass:
 ```
 ok  github.com/creativeyann17/go-delta/internal/chunker     0.006s
 ok  github.com/creativeyann17/go-delta/internal/chunkstore  0.002s
-ok  github.com/creativeyann17/go-delta/pkg/compress        0.036s
+ok  github.com/creativeyann17/go-delta/pkg/compress        0.053s  (includes ZIP tests)
 ```
 
 ## Performance Benchmarks
@@ -172,8 +209,10 @@ When adding tests for GDELTA02:
 
 ## Related Files
 
-- [pkg/compress/compress_chunked.go](pkg/compress/compress_chunked.go) - Implementation
-- [pkg/decompress/decompress_chunked.go](pkg/decompress/decompress_chunked.go) - Decompression
+- [pkg/compress/compress_chunked.go](pkg/compress/compress_chunked.go) - GDELTA02 implementation
+- [pkg/compress/compress_zip.go](pkg/compress/compress_zip.go) - ZIP implementation
+- [pkg/decompress/decompress_chunked.go](pkg/decompress/decompress_chunked.go) - GDELTA02 decompression
+- [pkg/decompress/decompress_zip.go](pkg/decompress/decompress_zip.go) - ZIP decompression
 - [internal/chunker/chunker.go](internal/chunker/chunker.go) - Chunking logic
 - [internal/chunkstore/store.go](internal/chunkstore/store.go) - Dedup store
-- [internal/format/gdelta02.go](internal/format/gdelta02.go) - Archive format
+- [internal/format/gdelta02.go](internal/format/gdelta02.go) - GDELTA02 archive format
