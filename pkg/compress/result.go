@@ -20,6 +20,7 @@ type Result struct {
 	UniqueChunks  uint64 // Unique chunks stored
 	DedupedChunks uint64 // Chunks that were deduplicated
 	BytesSaved    uint64 // Bytes saved through deduplication
+	Evictions     uint64 // Chunks evicted from LRU cache (doesn't affect archive)
 
 	// List of errors encountered (non-fatal)
 	Errors []error
@@ -44,4 +45,29 @@ func (r *Result) DedupRatio() float64 {
 // Success returns true if all files were processed without errors
 func (r *Result) Success() bool {
 	return len(r.Errors) == 0 && r.FilesProcessed == r.FilesTotal
+}
+
+// GetFilesTotal returns total files (interface method)
+func (r *Result) GetFilesTotal() int {
+	return r.FilesTotal
+}
+
+// GetFilesProcessed returns processed files (interface method)
+func (r *Result) GetFilesProcessed() int {
+	return r.FilesProcessed
+}
+
+// GetErrors returns the error list (interface method)
+func (r *Result) GetErrors() []error {
+	return r.Errors
+}
+
+// GetOriginalSize returns original size (interface method)
+func (r *Result) GetOriginalSize() uint64 {
+	return r.OriginalSize
+}
+
+// GetCompressedSize returns compressed size (interface method)
+func (r *Result) GetCompressedSize() uint64 {
+	return r.CompressedSize
 }

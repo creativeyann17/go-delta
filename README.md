@@ -386,6 +386,84 @@ fmt.Printf("Compressed %d files from custom list\n", result.FilesProcessed)
 
 **Note**: When using `Files`, the `InputPath` option is ignored. Each path in `Files` can be absolute or relative, and can point to files or directories. This option is designed for library use only and is not exposed in the CLI.
 
+### With Progress Tracking and Formatted Summary
+
+```go
+// Use built-in progress bar callback
+progressCb, progress := compress.ProgressBarCallback()
+
+opts := &compress.Options{
+    InputPath:  "/path/to/files",
+    OutputPath: "backup.delta",
+    Level:      9,
+}
+
+result, err := compress.Compress(opts, progressCb)
+
+// Wait for progress bars to complete
+progress.Wait()
+
+if err != nil {
+    log.Fatal(err)
+}
+
+// Print formatted summary
+fmt.Print(compress.FormatSummary(result))
+```
+
+**Helper Functions for Library Users:**
+
+**Compression Helpers:**
+- `compress.ProgressBarCallback()` - Creates a multi-progress bar callback (returns callback and progress container)
+- `compress.FormatSummary(result)` - Formats compression results as human-readable text
+- `compress.FormatSize(bytes)` - Converts bytes to human-readable size (KB, MB, GB, etc.)
+- `compress.TruncateLeft(path, maxLen)` - Truncates file paths from left, preserving filename
+
+**Decompression Helpers:**
+- `decompress.ProgressBarCallback()` - Creates a multi-progress bar callback (returns callback and progress container)
+- `decompress.FormatSummary(result)` - Formats decompression results as human-readable text
+
+**Note:** Both compression and decompression helpers use the same underlying generic implementation from `pkg/godelta`, ensuring consistent behavior and formatting across operations.
+
+### Decompression with Progress and Summary
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "github.com/creativeyann17/go-delta/pkg/decompress"
+)
+
+func main() {
+    // Use built-in progress bar callback
+    progressCb, progress := decompress.ProgressBarCallback()
+
+    opts := &decompress.Options{
+        InputPath:  "backup.delta",
+        OutputPath: "/restore/location",
+        Overwrite:  true,
+    }
+
+    result, err := decompress.Decompress(opts, progressCb)
+
+    // Wait for progress bars to complete
+    progress.Wait()
+
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Print formatted summary
+    fmt.Print(decompress.FormatSummary(result))
+
+    if !result.Success() {
+        log.Fatalf("Decompression completed with %d errors", len(result.Errors))
+    }
+}
+```
+
 ## API Reference
 
 ### Compression

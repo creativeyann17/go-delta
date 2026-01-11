@@ -9,11 +9,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/spf13/cobra"
 	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
 
 	"github.com/creativeyann17/go-delta/pkg/compress"
 )
@@ -167,14 +165,14 @@ func compressCmd() *cobra.Command {
 				log("  Thread Mem:  %.2f MB", float64(opts.MaxThreadMemory)/(1024*1024))
 			}
 			if opts.ChunkSize > 0 {
-				log("  Chunk Size:  %s", formatSize(opts.ChunkSize))
+				log("  Chunk Size:  %s", compress.FormatSize(opts.ChunkSize))
 				if opts.ChunkStoreSize > 0 {
 					// Calculate max chunks accounting for overhead (same formula as compress_chunked.go)
 					const overheadPerChunk = 120
 					effectiveBytesPerChunk := opts.ChunkSize + overheadPerChunk
 					maxChunks := (opts.ChunkStoreSize * 1024 * 1024) / effectiveBytesPerChunk
 					log("  Store Size:  %s (~%d chunks in RAM for dedup lookups)",
-						formatSize(opts.ChunkStoreSize*1024*1024), maxChunks)
+						compress.FormatSize(opts.ChunkStoreSize*1024*1024), maxChunks)
 					log("               Note: Archive size NOT limited by this - all unique chunks are saved")
 				}
 			}
@@ -183,79 +181,12 @@ func compressCmd() *cobra.Command {
 			}
 			log("")
 
-			// Multi-progress bar container
+			// Create progress callback and progress container
+			var progressCb compress.ProgressCallback
 			var progress *mpb.Progress
-			var overallBar *mpb.Bar
-			var fileBars sync.Map // map[string]*mpb.Bar
 
 			if !quiet && !verbose {
-				progress = mpb.New(
-					mpb.WithWidth(60),
-					mpb.WithRefreshRate(100),
-				)
-			}
-
-			// Progress callback
-			progressCb := func(event compress.ProgressEvent) {
-				if quiet || progress == nil {
-					return
-				}
-
-				switch event.Type {
-				case compress.EventStart:
-					// Create overall progress bar (at bottom via priority)
-					overallBar = progress.AddBar(event.Total,
-						mpb.PrependDecorators(
-							decor.Name("Total", decor.WC{C: decor.DindentRight | decor.DextraSpace}),
-							decor.CountersNoUnit("%d / %d", decor.WCSyncWidth),
-						),
-						mpb.AppendDecorators(
-							decor.Percentage(decor.WC{W: 5}),
-						),
-						mpb.BarPriority(1000), // High priority = bottom
-					)
-
-				case compress.EventFileStart:
-					// Create a bar for this file
-					shortName := truncateLeft(event.FilePath, 30)
-					bar := progress.AddBar(event.Total,
-						mpb.PrependDecorators(
-							decor.Name(shortName, decor.WC{C: decor.DindentRight | decor.DextraSpace, W: 32}),
-						),
-						mpb.AppendDecorators(
-							decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 18}),
-							decor.Percentage(decor.WC{W: 5}),
-						),
-						mpb.BarRemoveOnComplete(),
-					)
-					fileBars.Store(event.FilePath, bar)
-
-				case compress.EventFileProgress:
-					if bar, ok := fileBars.Load(event.FilePath); ok {
-						bar.(*mpb.Bar).SetCurrent(event.Current)
-					}
-
-				case compress.EventFileComplete:
-					if bar, ok := fileBars.Load(event.FilePath); ok {
-						bar.(*mpb.Bar).SetCurrent(event.Total)
-						fileBars.Delete(event.FilePath)
-					}
-					if overallBar != nil {
-						overallBar.Increment()
-					}
-
-				case compress.EventError:
-					if bar, ok := fileBars.Load(event.FilePath); ok {
-						bar.(*mpb.Bar).Abort(true)
-						fileBars.Delete(event.FilePath)
-					}
-					if overallBar != nil {
-						overallBar.Increment()
-					}
-
-				case compress.EventComplete:
-					// Handled after Compress returns
-				}
+				progressCb, progress = compress.ProgressBarCallback()
 			}
 
 			// Perform compression
@@ -272,41 +203,7 @@ func compressCmd() *cobra.Command {
 
 			// Final report
 			fmt.Println()
-
-			if len(result.Errors) > 0 {
-				fmt.Fprintf(os.Stderr, "Completed with %d errors:\n", len(result.Errors))
-				for _, e := range result.Errors {
-					fmt.Fprintf(os.Stderr, "  - %v\n", e)
-				}
-				fmt.Println()
-			}
-
-			ratio := result.CompressionRatio()
-			fmt.Printf("Summary:\n")
-			fmt.Printf("  Files processed: %d / %d\n", result.FilesProcessed, result.FilesTotal)
-			fmt.Printf("  Original size:   %.2f MiB\n", float64(result.OriginalSize)/1024/1024)
-
-			if dryRun {
-				fmt.Printf("  Compressed size: %.2f MiB (estimated)\n", float64(result.CompressedSize)/1024/1024)
-			} else {
-				fmt.Printf("  Compressed size: %.2f MiB\n", float64(result.CompressedSize)/1024/1024)
-			}
-
-			fmt.Printf("  Ratio:           %.1f%%\n", ratio)
-
-			// Show deduplication stats if chunking was enabled
-			if opts.ChunkSize > 0 && result.TotalChunks > 0 {
-				fmt.Printf("\nDeduplication:\n")
-				fmt.Printf("  Total chunks:    %d\n", result.TotalChunks)
-				fmt.Printf("  Unique chunks:   %d\n", result.UniqueChunks)
-				fmt.Printf("  Deduped chunks:  %d\n", result.DedupedChunks)
-				fmt.Printf("  Dedup ratio:     %.1f%%\n", result.DedupRatio())
-				fmt.Printf("  Bytes saved:     %.2f MiB\n", float64(result.BytesSaved)/1024/1024)
-			}
-
-			if dryRun {
-				fmt.Println("\nDry run complete - no archive written.")
-			}
+			fmt.Print(compress.FormatSummary(result, opts))
 
 			if len(result.Errors) > 0 {
 				return fmt.Errorf("finished with %d errors", len(result.Errors))
@@ -398,38 +295,3 @@ const (
 // - sysmem_linux.go (Linux)
 // - sysmem_darwin.go (macOS)
 // - sysmem_windows.go (Windows)
-// formatSize formats bytes into human-readable string
-func formatSize(bytes uint64) string {
-	const (
-		KB = 1024
-		MB = 1024 * KB
-		GB = 1024 * MB
-	)
-
-	switch {
-	case bytes >= GB:
-		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
-	case bytes >= MB:
-		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
-	case bytes >= KB:
-		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
-	default:
-		return fmt.Sprintf("%d B", bytes)
-	}
-}
-
-// truncateLeft truncates a path from the left to fit maxLen, preserving the filename
-func truncateLeft(path string, maxLen int) string {
-	if len(path) <= maxLen {
-		return path
-	}
-
-	// Try to preserve at least the filename
-	filename := filepath.Base(path)
-	if len(filename) >= maxLen-3 {
-		return "..." + filename[len(filename)-(maxLen-3):]
-	}
-
-	// Truncate from left with ellipsis
-	return "..." + path[len(path)-(maxLen-3):]
-}

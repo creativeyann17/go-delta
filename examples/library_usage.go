@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/creativeyann17/go-delta/pkg/compress"
+	"github.com/creativeyann17/go-delta/pkg/decompress"
 )
 
 func main() {
@@ -16,7 +17,19 @@ func main() {
 	// Example 2: Compression with custom options
 	customExample()
 
-	// Example 3: Compression with progress tracking
+	// Example 3: Custom file list (library only)
+	customFilesExample()
+
+	// Example 4: Built-in progress helpers
+	helpersExample()
+
+	// Example 5: Chunk-based deduplication
+	chunkExample()
+
+	// Example 6: Decompression with helpers
+	decompressExample()
+
+	// Example 7: Custom progress tracking (advanced)
 	progressExample()
 }
 
@@ -61,13 +74,126 @@ func customExample() {
 	}
 }
 
+func customFilesExample() {
+	// Compress specific files/folders without InputPath
+	// This is a library-only feature not exposed in CLI
+	opts := &compress.Options{
+		Files: []string{
+			"/path/to/file1.txt",
+			"/path/to/folder1",
+			"/another/path/file2.log",
+			"relative/path/to/folder",
+		},
+		OutputPath: "custom.delta",
+		MaxThreads: 4,
+		Level:      9,
+	}
+
+	result, err := compress.Compress(opts, nil)
+	if err != nil {
+		log.Fatalf("Compression failed: %v", err)
+	}
+
+	fmt.Printf("Compressed %d files from custom list\n", result.FilesProcessed)
+}
+
+func helpersExample() {
+	// Use built-in progress bar and summary helpers
+	progressCb, progress := compress.ProgressBarCallback()
+
+	opts := &compress.Options{
+		InputPath:  "/path/to/files",
+		OutputPath: "backup.delta",
+		Level:      9,
+	}
+
+	result, err := compress.Compress(opts, progressCb)
+
+	// Wait for progress bars to complete
+	progress.Wait()
+
+	if err != nil {
+		log.Fatalf("Compression failed: %v", err)
+	}
+
+	// Print formatted summary
+	fmt.Print(compress.FormatSummary(result, opts))
+
+	if !result.Success() {
+		log.Fatalf("Completed with %d errors", len(result.Errors))
+	}
+}
+
+func chunkExample() {
+	opts := &compress.Options{
+		InputPath:       "/path/to/files",
+		OutputPath:      "deduplicated.delta",
+		MaxThreads:      4,
+		Level:           5,
+		ChunkSize:       128 * 1024,             // 128 KB chunks
+		ChunkStoreSize:  5 * 1024,               // 5 GB chunk store limit (in MB)
+		MaxThreadMemory: 2 * 1024 * 1024 * 1024, // 2 GB per thread
+	}
+
+	result, err := compress.Compress(opts, nil)
+	if err != nil {
+		log.Fatalf("Compression failed: %v", err)
+	}
+
+	fmt.Printf("Compressed %d files: %.2f MB -> %.2f MB (%.1f%%)\n",
+		result.FilesProcessed,
+		float64(result.OriginalSize)/1024/1024,
+		float64(result.CompressedSize)/1024/1024,
+		result.CompressionRatio())
+
+	if result.TotalChunks > 0 {
+		fmt.Printf("Deduplication: %d/%d chunks deduplicated (%.1f%%), %.2f MB saved\n",
+			result.DedupedChunks,
+			result.TotalChunks,
+			result.DedupRatio(),
+			float64(result.BytesSaved)/1024/1024)
+
+		if result.Evictions > 0 {
+			fmt.Printf("Evictions: %d chunks evicted from cache\n", result.Evictions)
+		}
+	}
+}
+
+func decompressExample() {
+	// Use built-in progress bar and summary helpers
+	progressCb, progress := decompress.ProgressBarCallback()
+
+	opts := &decompress.Options{
+		InputPath:  "backup.delta",
+		OutputPath: "/restore/location",
+		Overwrite:  true,
+	}
+
+	result, err := decompress.Decompress(opts, progressCb)
+
+	// Wait for progress bars to complete
+	progress.Wait()
+
+	if err != nil {
+		log.Fatalf("Decompression failed: %v", err)
+	}
+
+	// Print formatted summary
+	fmt.Print(decompress.FormatSummary(result))
+
+	if !result.Success() {
+		log.Fatalf("Decompression completed with %d errors", len(result.Errors))
+	}
+}
+
 func progressExample() {
+	// Advanced: Custom progress tracking with your own callback
 	opts := compress.DefaultOptions()
 	opts.InputPath = "/path/to/files"
 	opts.OutputPath = "backup.delta"
 	opts.Level = 9
 
-	// Custom progress tracking
+	// Custom progress callback for advanced use cases
 	progressCb := func(event compress.ProgressEvent) {
 		switch event.Type {
 		case compress.EventStart:

@@ -23,3 +23,28 @@ type Result struct {
 func (r *Result) Success() bool {
 	return len(r.Errors) == 0 && r.FilesProcessed == r.FilesTotal
 }
+
+// GetFilesTotal returns total files (interface method)
+func (r *Result) GetFilesTotal() int {
+	return r.FilesTotal
+}
+
+// GetFilesProcessed returns processed files (interface method)
+func (r *Result) GetFilesProcessed() int {
+	return r.FilesProcessed
+}
+
+// GetErrors returns the error list (interface method)
+func (r *Result) GetErrors() []error {
+	return r.Errors
+}
+
+// GetOriginalSize returns decompressed size (interface method)
+func (r *Result) GetOriginalSize() uint64 {
+	return r.DecompressedSize
+}
+
+// GetCompressedSize returns compressed size (interface method)
+func (r *Result) GetCompressedSize() uint64 {
+	return r.CompressedSize
+}
