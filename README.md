@@ -22,6 +22,7 @@ A smart delta compression tool for backups written in Go.
 - **Robust cleanup** - Automatic temp file deletion on normal exit, errors, and interruptions (Ctrl+C)
 - **Cross-platform** - Native system memory detection for Linux, macOS, and Windows
 - **Subdirectory support** - Recursively compress directory structures
+- **Custom file selection** - Library API supports custom file/folder lists (independent of directory structure)
 - **Progress visualization** - Multi-bar progress tracking for concurrent operations
 - **CLI and Library** - Use as a command-line tool or Go library
 - **Compress & Decompress** - Full round-trip support with integrity validation
@@ -328,7 +329,13 @@ result, err := compress.Compress(opts, progressCb)
 
 ### With Chunk-Based Deduplication
 
-```go28 * 1024,           // 128 KB chunks
+```go
+opts := &compress.Options{
+    InputPath:       "/path/to/files",
+    OutputPath:      "backup.delta",
+    MaxThreads:      4,
+    Level:           5,
+    ChunkSize:       128 * 1024,           // 128 KB chunks
     ChunkStoreSize:  5 * 1024,             // 5 GB chunk store limit (in MB)
     MaxThreadMemory: 2 * 1024 * 1024 * 1024, // 2 GB per thread
 }
@@ -344,11 +351,6 @@ fmt.Printf("Compressed %d files: %.2f MB -> %.2f MB (%.1f%%)\n",
     float64(result.CompressedSize)/1024/1024,
     result.CompressionRatio())
 
-if result.TotalChunkscessed,
-    float64(result.OriginalSize)/1024/1024,
-    float64(result.CompressedSize)/1024/1024,
-    result.CompressionRatio())
-
 if result.ChunkSize > 0 {
     fmt.Printf("Deduplication: %d/%d chunks deduplicated (%.1f%%), %.2f MB saved\n",
         result.DedupedChunks,
@@ -358,6 +360,32 @@ if result.ChunkSize > 0 {
 }
 ```
 
+### With Custom File List (Library Only)
+
+```go
+// Compress specific files/folders without using InputPath
+opts := &compress.Options{
+    Files: []string{
+        "/path/to/file1.txt",
+        "/path/to/folder1",
+        "/another/path/file2.log",
+        "relative/path/to/folder",
+    },
+    OutputPath: "custom.delta",
+    MaxThreads: 4,
+    Level:      9,
+}
+
+result, err := compress.Compress(opts, nil)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("Compressed %d files from custom list\n", result.FilesProcessed)
+```
+
+**Note**: When using `Files`, the `InputPath` option is ignored. Each path in `Files` can be absolute or relative, and can point to files or directories. This option is designed for library use only and is not exposed in the CLI.
+
 ## API Reference
 
 ### Compression
@@ -365,27 +393,22 @@ if result.ChunkSize > 0 {
 #### `compress.Options`
 ```go
 type Options struct {
-    InputPath       string  // Source file/directory
-    OutputPath      string  // Output archive path
-    MaxThreadMemory uint64  // Max memory per thread in bytes (0=auto-calculate from input size)
-    Level           int     // Compression level 1-22 (default: 5)
-    ChunkSize       uint64  // Chunk size in bytes for dedup (0=disabled, min 4096, uses GDELTA01)
-    ChunkStoreSize  uint64  // Max chunk store size in MB (0=unlimited, limits RAM not archive sizeed, uses GDELTA01)
-    ChunkStoreSize  uint64  // Max chunk store size in MB (0=unlimited)
-    DryRun          bool    // Simulate without writing
-    Verbose         bool    // Detailed logging
-    Quiet           bool    // Suppress output
+    InputPath       string   // Source file/directory (ignored if Files is provided)
+    Files           []string // Custom list of files/folders to compress (library only, overrides InputPath)
+    OutputPath      string   // Output archive path
+    MaxThreads      int      // Max concurrent threads (default: CPU count)
+    MaxThreadMemory uint64   // Max memory per thread in bytes (0=auto-calculate from input size)
+    Level           int      // Compression level 1-22 for GDELTA, 1-9 for ZIP (default: 5)
+    ChunkSize       uint64   // Chunk size in bytes for dedup (0=disabled, min 4096, GDELTA only)
+    ChunkStoreSize  uint64   // Max chunk store size in MB (0=unlimited, GDELTA only)
+    UseZipFormat    bool     // Create ZIP archive instead of GDELTA (no deduplication)
+    DryRun          bool     // Simulate without writing
+    Verbose         bool     // Detailed logging
+    Quiet           bool     // Suppress output
 }
 ```
 
 #### `compress.Result`
-```go
-type Result struct {
-    FilesTotal     int      // Total files found
-    FilesProcessed int      // Successfully compressed
-    OriginalSize   uint64   // Total original bytes
-    CompressedSize uint64   // Total compressed bytes
-    Errors         []error  // Non-fatal errors
 ```go
 type Result struct {
     FilesTotal     int      // Total files found

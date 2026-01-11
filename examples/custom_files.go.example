@@ -1,0 +1,45 @@
+// Example: Using custom file list for compression (library only)
+
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/creativeyann17/go-delta/pkg/compress"
+)
+
+func main() {
+	// Example: Compress specific files and folders from different locations
+	opts := &compress.Options{
+		// Custom file list - can mix files and directories, absolute or relative paths
+		Files: []string{
+			"/home/user/important/document.pdf",
+			"/var/log/app.log",
+			"/home/user/projects/myproject",
+			"./local/file.txt",
+		},
+		OutputPath: "custom_backup.delta",
+		MaxThreads: 4,
+		Level:      9,
+		Verbose:    true,
+	}
+
+	result, err := compress.Compress(opts, nil)
+	if err != nil {
+		log.Fatalf("Compression failed: %v", err)
+	}
+
+	fmt.Printf("\nCompression completed!\n")
+	fmt.Printf("Files processed: %d/%d\n", result.FilesProcessed, result.FilesTotal)
+	fmt.Printf("Original size: %.2f MB\n", float64(result.OriginalSize)/1024/1024)
+	fmt.Printf("Compressed size: %.2f MB\n", float64(result.CompressedSize)/1024/1024)
+	fmt.Printf("Compression ratio: %.1f%%\n", result.CompressionRatio())
+
+	if !result.Success() {
+		fmt.Printf("\nErrors encountered: %d\n", len(result.Errors))
+		for _, e := range result.Errors {
+			fmt.Printf("  - %v\n", e)
+		}
+	}
+}

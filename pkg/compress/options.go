@@ -9,7 +9,14 @@ import (
 // Options configures the compression behavior
 type Options struct {
 	// Input path (file or directory)
+	// Ignored if Files is provided
 	InputPath string
+
+	// Files allows library users to provide a custom list of files/folders to compress
+	// When set, InputPath is ignored
+	// Each path can be absolute or relative, file or directory
+	// This option is for library use only (not exposed in CLI)
+	Files []string
 
 	// Output archive path
 	OutputPath string
@@ -74,7 +81,7 @@ func DefaultOptions() *Options {
 
 // Validate checks if options are valid
 func (o *Options) Validate() error {
-	if o.InputPath == "" {
+	if o.InputPath == "" && len(o.Files) == 0 {
 		return ErrInputRequired
 	}
 	if o.OutputPath == "" {

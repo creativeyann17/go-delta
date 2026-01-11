@@ -65,59 +65,14 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 
 	result := &Result{}
 
-	// Collect all files grouped by folder
-	folderMap := make(map[string][]fileTask)
-	var totalOrigSize uint64
-	var totalFiles int
-
-	walkErr := filepath.Walk(opts.InputPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", path, err))
-			return nil // continue
-		}
-		if info.IsDir() || !info.Mode().IsRegular() {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(opts.InputPath, path)
-		if err != nil {
-			relPath = path
-		}
-
-		// Group by immediate parent folder
-		folderPath := filepath.Dir(relPath)
-		if folderPath == "." {
-			folderPath = "" // Root level files
-		}
-
-		task := fileTask{
-			AbsPath:  path,
-			RelPath:  relPath,
-			Info:     info,
-			OrigSize: uint64(info.Size()),
-		}
-
-		folderMap[folderPath] = append(folderMap[folderPath], task)
-		totalOrigSize += uint64(info.Size())
-		totalFiles++
-		return nil
-	})
-
-	if walkErr != nil {
-		return nil, fmt.Errorf("directory walk failed: %w", walkErr)
+	// Collect all files from either Files list or InputPath
+	foldersToCompress, totalFiles, totalOrigSize, err := collectFiles(opts, result)
+	if err != nil {
+		return nil, err
 	}
 
 	if totalFiles == 0 {
 		return nil, ErrNoFiles
-	}
-
-	// Convert folder map to task list
-	foldersToCompress := make([]folderTask, 0, len(folderMap))
-	for folderPath, files := range folderMap {
-		foldersToCompress = append(foldersToCompress, folderTask{
-			FolderPath: folderPath,
-			Files:      files,
-		})
 	}
 
 	result.FilesTotal = totalFiles
@@ -491,4 +446,87 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 		pr.onRead(n)
 	}
 	return n, err
+}
+
+// collectFiles gathers all files from either the Files list or InputPath
+// Returns folder tasks, total file count, total size, and any error
+func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, error) {
+	folderMap := make(map[string][]fileTask)
+	var totalOrigSize uint64
+	var totalFiles int
+	var baseDir string
+
+	// Determine base directory for relative paths
+	if len(opts.Files) > 0 {
+		// Use current working directory as base when Files is provided
+		baseDir, _ = os.Getwd()
+	} else {
+		baseDir = opts.InputPath
+	}
+
+	// Function to process a single path (file or directory)
+	processPath := func(inputPath string) error {
+		return filepath.Walk(inputPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", path, err))
+				return nil // continue
+			}
+			if info.IsDir() || !info.Mode().IsRegular() {
+				return nil
+			}
+
+			relPath, err := filepath.Rel(baseDir, path)
+			if err != nil {
+				// If relative path fails, use the path from the input root
+				relPath, err = filepath.Rel(inputPath, path)
+				if err != nil {
+					relPath = filepath.Base(path)
+				}
+			}
+
+			// Group by immediate parent folder
+			folderPath := filepath.Dir(relPath)
+			if folderPath == "." {
+				folderPath = "" // Root level files
+			}
+
+			task := fileTask{
+				AbsPath:  path,
+				RelPath:  relPath,
+				Info:     info,
+				OrigSize: uint64(info.Size()),
+			}
+
+			folderMap[folderPath] = append(folderMap[folderPath], task)
+			totalOrigSize += uint64(info.Size())
+			totalFiles++
+			return nil
+		})
+	}
+
+	// Process either custom Files list or InputPath
+	if len(opts.Files) > 0 {
+		// Use custom file list
+		for _, path := range opts.Files {
+			if err := processPath(path); err != nil {
+				return nil, 0, 0, fmt.Errorf("processing %s: %w", path, err)
+			}
+		}
+	} else {
+		// Use InputPath
+		if err := processPath(opts.InputPath); err != nil {
+			return nil, 0, 0, fmt.Errorf("directory walk failed: %w", err)
+		}
+	}
+
+	// Convert folder map to task list
+	foldersToCompress := make([]folderTask, 0, len(folderMap))
+	for folderPath, files := range folderMap {
+		foldersToCompress = append(foldersToCompress, folderTask{
+			FolderPath: folderPath,
+			Files:      files,
+		})
+	}
+
+	return foldersToCompress, totalFiles, totalOrigSize, nil
 }
