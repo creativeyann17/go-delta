@@ -23,6 +23,17 @@ type Options struct {
 	// Default: 0
 	MaxThreadMemory uint64
 
+	// Chunk size for content-based deduplication (bytes)
+	// 0 = disabled (traditional file-level compression)
+	// Default: 0
+	ChunkSize uint64
+
+	// Maximum chunk store size in MB (bounds memory usage for deduplication)
+	// Calculated as: maxChunks = ChunkStoreSize / (ChunkSize / 1MB)
+	// 0 = unlimited (store all unique chunks)
+	// Default: 0
+	ChunkStoreSize uint64
+
 	// Compression level (1-22 for zstd)
 	// 1=fastest, 9=balanced, 19+=maximum compression
 	// Default: 5
@@ -47,6 +58,7 @@ func DefaultOptions() *Options {
 	return &Options{
 		MaxThreads:      runtime.NumCPU(),
 		MaxThreadMemory: 0, // Unlimited by default
+		ChunkSize:       0, // Chunking disabled by default
 		Level:           5,
 		DryRun:          false,
 		Verbose:         false,

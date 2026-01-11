@@ -131,6 +131,13 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		})
 	}
 
+	// Route to chunked compression if ChunkSize > 0
+	if opts.ChunkSize > 0 {
+		return result, compressWithChunking(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result)
+	}
+
+	// Traditional GDELTA01 compression (file-level)
+
 	// Create archive file (if not dry-run)
 	var writer io.WriteSeeker
 	var writerMu sync.Mutex

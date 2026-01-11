@@ -52,10 +52,40 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	}
 	defer archiveFile.Close()
 
+	// Peek at magic to determine format version
+	magic := make([]byte, 8)
+	if _, err := io.ReadFull(archiveFile, magic); err != nil {
+		return nil, fmt.Errorf("read magic: %w", err)
+	}
+
+	// Reset to start
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek to start: %w", err)
+	}
+
+	// Route based on format version
+	switch string(magic) {
+	case format.ArchiveMagic02:
+		// GDELTA02 with chunking
+		err := decompressGDelta02(archiveFile, opts, progressCb, result)
+		return result, err
+
+	case format.ArchiveMagic:
+		// GDELTA01 traditional format
+		err := decompressGDelta01(archiveFile, opts, progressCb, result)
+		return result, err
+
+	default:
+		return nil, fmt.Errorf("unknown archive format: %q", magic)
+	}
+}
+
+// decompressGDelta01 handles the traditional GDELTA01 format
+func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb ProgressCallback, result *Result) error {
 	// Create archive reader
 	reader, err := format.NewArchiveReader(archiveFile)
 	if err != nil {
-		return nil, fmt.Errorf("read archive header: %w", err)
+		return fmt.Errorf("read archive header: %w", err)
 	}
 
 	fileCount := reader.FileCount()
@@ -70,7 +100,7 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 
 	// Create output directory
 	if err := os.MkdirAll(opts.OutputPath, 0755); err != nil {
-		return nil, fmt.Errorf("create output directory: %w", err)
+		return fmt.Errorf("create output directory: %w", err)
 	}
 
 	// Process files sequentially (reading entry headers and data in order)
@@ -133,7 +163,7 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		})
 	}
 
-	return result, nil
+	return nil
 }
 
 // decompressFileFromCurrentPosition decompresses a file from the current archive position

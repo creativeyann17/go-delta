@@ -67,7 +67,7 @@ func decompressCmd() *cobra.Command {
 			var overallBar *mpb.Bar
 			var fileBars sync.Map // map[string]*mpb.Bar
 
-			if !quiet {
+			if !quiet && !verbose {
 				progress = mpb.New(
 					mpb.WithWidth(60),
 					mpb.WithRefreshRate(100),
