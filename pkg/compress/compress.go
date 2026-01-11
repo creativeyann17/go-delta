@@ -552,20 +552,8 @@ func findCommonBasePath(paths []string) string {
 	if len(paths) == 0 {
 		return "."
 	}
-	if len(paths) == 1 {
-		// For single path, use its directory (or itself if it's a directory)
-		absPath, err := filepath.Abs(paths[0])
-		if err != nil {
-			return filepath.Dir(paths[0])
-		}
-		info, err := os.Stat(absPath)
-		if err != nil || !info.IsDir() {
-			return filepath.Dir(absPath)
-		}
-		return absPath
-	}
 
-	// Convert all paths to absolute and clean them
+	// Convert all paths to absolute and clean them (no I/O)
 	absPaths := make([]string, len(paths))
 	for i, p := range paths {
 		abs, err := filepath.Abs(p)
@@ -573,6 +561,13 @@ func findCommonBasePath(paths []string) string {
 			abs = p
 		}
 		absPaths[i] = filepath.Clean(abs)
+	}
+
+	if len(absPaths) == 1 {
+		// For single path, just use its directory
+		// We don't need to stat to check if it's a directory - the caller
+		// will handle the actual file operations
+		return filepath.Dir(absPaths[0])
 	}
 
 	// Split first path into components
