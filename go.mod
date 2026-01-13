@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/jotfs/fastcdc-go v0.2.0
 	github.com/klauspost/compress v1.18.2
 	github.com/vbauerster/mpb/v8 v8.11.3
 	github.com/zeebo/blake3 v0.2.4

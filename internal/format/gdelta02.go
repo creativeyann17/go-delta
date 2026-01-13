@@ -2,9 +2,11 @@
 package format
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 )
 
 const (
@@ -47,8 +49,20 @@ func WriteGDelta02Header(w io.Writer, chunkSize uint64, fileCount uint32, chunkC
 
 // WriteChunkIndex writes the chunk index section
 // Format: For each chunk: Hash(32) + Offset(8) + CompressedSize(8) + OriginalSize(8)
+// Chunks are sorted by hash for deterministic output.
 func WriteChunkIndex(w io.Writer, chunks map[[32]byte]ChunkInfo) error {
-	for _, chunk := range chunks {
+	// Sort hashes for deterministic output
+	hashes := make([][32]byte, 0, len(chunks))
+	for hash := range chunks {
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool {
+		return bytes.Compare(hashes[i][:], hashes[j][:]) < 0
+	})
+
+	for _, hash := range hashes {
+		chunk := chunks[hash]
+
 		// Write hash
 		if _, err := w.Write(chunk.Hash[:]); err != nil {
 			return fmt.Errorf("write chunk hash: %w", err)

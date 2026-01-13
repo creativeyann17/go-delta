@@ -244,30 +244,32 @@ func TestChunkedWithSubdirectories(t *testing.T) {
 }
 
 func TestChunkerSplitting(t *testing.T) {
+	// Test with content-defined chunking (FastCDC)
+	// Chunk counts are variable based on content patterns, not fixed sizes
 	tests := []struct {
-		name       string
-		chunkSize  uint64
-		dataSize   int
-		wantChunks int
+		name      string
+		avgSize   uint64
+		dataSize  int
+		minChunks int // Minimum expected chunks
 	}{
 		{"Small file, large chunks", 1024 * 1024, 500, 1},
-		{"Exact chunk size", 1024, 1024, 1},
-		{"Multiple chunks", 1024, 3000, 3},
-		{"Large file", 16 * 1024, 100 * 1024, 7}, // 100KB / 16KB = ~7 chunks
+		{"Medium file", 1024, 5000, 1},
+		{"Large file", 16 * 1024, 200 * 1024, 1}, // At least 1 chunk
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := chunker.New(tt.chunkSize)
-			data := bytes.Repeat([]byte("x"), tt.dataSize)
+			c := chunker.New(tt.avgSize)
+			data := bytes.Repeat([]byte("test data content "), tt.dataSize/18+1)
+			data = data[:tt.dataSize] // Trim to exact size
 
 			chunks, err := c.Split(bytes.NewReader(data))
 			if err != nil {
 				t.Fatalf("Split failed: %v", err)
 			}
 
-			if len(chunks) != tt.wantChunks {
-				t.Errorf("Expected %d chunks, got %d", tt.wantChunks, len(chunks))
+			if len(chunks) < tt.minChunks {
+				t.Errorf("Expected at least %d chunks, got %d", tt.minChunks, len(chunks))
 			}
 
 			// Verify total size matches
@@ -278,6 +280,15 @@ func TestChunkerSplitting(t *testing.T) {
 
 			if totalSize != uint64(tt.dataSize) {
 				t.Errorf("Total chunk size %d doesn't match data size %d", totalSize, tt.dataSize)
+			}
+
+			// Verify reassembly
+			var reassembled []byte
+			for _, chunk := range chunks {
+				reassembled = append(reassembled, chunk.Data...)
+			}
+			if !bytes.Equal(reassembled, data) {
+				t.Error("Reassembled data doesn't match original")
 			}
 		})
 	}
@@ -402,4 +413,183 @@ func TestEmptyFileWithChunking(t *testing.T) {
 	if len(content) != 0 {
 		t.Errorf("Empty file should have 0 bytes, got %d", len(content))
 	}
+}
+
+// TestChunkedSmallerThanNonChunked verifies that GDELTA02 (chunked with CDC)
+// produces smaller archives than GDELTA01 (non-chunked) when files share content.
+// This demonstrates the value of content-defined chunking for deduplication.
+func TestChunkedSmallerThanNonChunked(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+
+	if err := os.MkdirAll(inputDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create pseudo-random but reproducible base content (~100KB)
+	// This simulates real data that doesn't compress as well as pure repetition
+	// but has shared content across files (like log files, backups, etc.)
+	baseContent := make([]byte, 100*1024)
+	for i := range baseContent {
+		// Pseudo-random pattern that's not easily compressible
+		baseContent[i] = byte((i*7 + i/256*13 + i/65536*17) % 256)
+	}
+
+	// Create multiple files with the same base content but different prefixes/suffixes
+	// With CDC, the shared content will deduplicate despite the shifts
+	files := []struct {
+		name    string
+		content []byte
+	}{
+		{"file1.bin", baseContent},
+		{"file2.bin", append([]byte("PREFIX_A:"), baseContent...)},
+		{"file3.bin", append([]byte("DIFFERENT_PREFIX_BB:"), baseContent...)},
+		{"file4.bin", append(baseContent, []byte(":SUFFIX_C")...)},
+		{"file5.bin", baseContent}, // Exact duplicate
+	}
+
+	var totalOriginalSize int64
+	for _, f := range files {
+		path := filepath.Join(inputDir, f.name)
+		if err := os.WriteFile(path, f.content, 0644); err != nil {
+			t.Fatal(err)
+		}
+		totalOriginalSize += int64(len(f.content))
+	}
+
+	// Compress without chunking (GDELTA01)
+	nonChunkedPath := filepath.Join(tempDir, "non-chunked.gdelta")
+	nonChunkedOpts := &Options{
+		InputPath:  inputDir,
+		OutputPath: nonChunkedPath,
+		ChunkSize:  0, // No chunking
+		Level:      5,
+	}
+
+	_, err := Compress(nonChunkedOpts, nil)
+	if err != nil {
+		t.Fatalf("Non-chunked compression failed: %v", err)
+	}
+
+	nonChunkedInfo, err := os.Stat(nonChunkedPath)
+	if err != nil {
+		t.Fatalf("Failed to stat non-chunked archive: %v", err)
+	}
+	nonChunkedSize := nonChunkedInfo.Size()
+
+	// Compress with chunking (GDELTA02 + FastCDC)
+	chunkedPath := filepath.Join(tempDir, "chunked.gdelta")
+	chunkedOpts := &Options{
+		InputPath:  inputDir,
+		OutputPath: chunkedPath,
+		ChunkSize:  8 * 1024, // 8KB average chunk size
+		Level:      5,
+	}
+
+	chunkedResult, err := Compress(chunkedOpts, nil)
+	if err != nil {
+		t.Fatalf("Chunked compression failed: %v", err)
+	}
+
+	chunkedInfo, err := os.Stat(chunkedPath)
+	if err != nil {
+		t.Fatalf("Failed to stat chunked archive: %v", err)
+	}
+	chunkedSize := chunkedInfo.Size()
+
+	// Log results
+	t.Logf("Original size:     %d bytes", totalOriginalSize)
+	t.Logf("Non-chunked size:  %d bytes (%.1f%% of original)", nonChunkedSize, float64(nonChunkedSize)/float64(totalOriginalSize)*100)
+	t.Logf("Chunked size:      %d bytes (%.1f%% of original)", chunkedSize, float64(chunkedSize)/float64(totalOriginalSize)*100)
+	t.Logf("Chunked savings:   %d bytes (%.1f%% smaller than non-chunked)", nonChunkedSize-chunkedSize, float64(nonChunkedSize-chunkedSize)/float64(nonChunkedSize)*100)
+	t.Logf("Dedup stats:       %d total chunks, %d unique, %d deduped (%.1f%% ratio)",
+		chunkedResult.TotalChunks, chunkedResult.UniqueChunks, chunkedResult.DedupedChunks,
+		float64(chunkedResult.DedupedChunks)/float64(chunkedResult.TotalChunks)*100)
+
+	// Assert: chunked should be smaller than non-chunked for data with duplicates
+	if chunkedSize >= nonChunkedSize {
+		t.Errorf("Chunked archive (%d bytes) should be smaller than non-chunked (%d bytes) when files share content",
+			chunkedSize, nonChunkedSize)
+	}
+
+	// Assert: deduplication should have occurred
+	if chunkedResult.DedupedChunks == 0 {
+		t.Error("Expected some chunks to be deduplicated")
+	}
+
+	// Assert: meaningful savings from deduplication
+	// Even 5% is significant when dealing with large backup datasets
+	savingsPercent := float64(nonChunkedSize-chunkedSize) / float64(nonChunkedSize) * 100
+	if savingsPercent < 5 {
+		t.Errorf("Expected at least 5%% size reduction from dedup, got %.1f%%", savingsPercent)
+	}
+
+	// Verify round-trip works
+	outputDir := filepath.Join(tempDir, "output")
+	decompressOpts := &decompress.Options{
+		InputPath:  chunkedPath,
+		OutputPath: outputDir,
+	}
+
+	_, err = decompress.Decompress(decompressOpts, nil)
+	if err != nil {
+		t.Fatalf("Decompression failed: %v", err)
+	}
+
+	// Verify content integrity
+	for _, f := range files {
+		content, err := os.ReadFile(filepath.Join(outputDir, f.name))
+		if err != nil {
+			t.Fatalf("Failed to read %s: %v", f.name, err)
+		}
+		if !bytes.Equal(content, f.content) {
+			t.Errorf("Content mismatch for %s", f.name)
+		}
+	}
+}
+
+// BenchmarkChunkedVsNonChunked compares compression performance and size
+func BenchmarkChunkedVsNonChunked(b *testing.B) {
+	tempDir := b.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+	os.MkdirAll(inputDir, 0755)
+
+	// Create pseudo-random test data with shared content
+	baseContent := make([]byte, 100*1024)
+	for i := range baseContent {
+		baseContent[i] = byte((i*7 + i/256*13) % 256)
+	}
+	for i := 0; i < 5; i++ {
+		prefix := bytes.Repeat([]byte{byte('A' + i)}, i*20)
+		content := append(prefix, baseContent...)
+		os.WriteFile(filepath.Join(inputDir, "file"+string(rune('1'+i))+".bin"), content, 0644)
+	}
+
+	b.Run("NonChunked", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			archivePath := filepath.Join(tempDir, "bench-nonchunked.gdelta")
+			opts := &Options{
+				InputPath:  inputDir,
+				OutputPath: archivePath,
+				ChunkSize:  0,
+				Level:      3,
+			}
+			Compress(opts, nil)
+			os.Remove(archivePath)
+		}
+	})
+
+	b.Run("Chunked8KB", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			archivePath := filepath.Join(tempDir, "bench-chunked.gdelta")
+			opts := &Options{
+				InputPath:  inputDir,
+				OutputPath: archivePath,
+				ChunkSize:  8 * 1024,
+				Level:      3,
+			}
+			Compress(opts, nil)
+			os.Remove(archivePath)
+		}
+	})
 }

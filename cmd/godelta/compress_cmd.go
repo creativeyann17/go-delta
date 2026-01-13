@@ -217,7 +217,7 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "Output archive file")
 	cmd.Flags().IntVarP(&maxThreads, "threads", "t", runtime.NumCPU(), "Max concurrent threads")
 	cmd.Flags().StringVar(&threadMemoryStr, "thread-memory", "0", "Max memory per thread (e.g. 128MB, 1GB, 0=auto)")
-	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Chunk size for deduplication (e.g. 64KB, 512KB, min: 4KB, 0=disabled)")
+	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Average chunk size for content-defined dedup (e.g. 64KB, 512KB, actual chunks vary 1/4x to 4x, 0=disabled)")
 	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=unlimited, does NOT limit archive size)")
 	cmd.Flags().BoolVar(&useZipFormat, "zip", false, "Create standard ZIP archive instead of GDELTA format (universally compatible)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Simulate without writing anything")

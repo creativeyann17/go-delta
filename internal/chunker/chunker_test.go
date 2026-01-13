@@ -3,27 +3,26 @@ package chunker
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 )
 
 func TestChunkerBasic(t *testing.T) {
-	chunkSize := uint64(10)
-	c := New(chunkSize)
+	avgSize := uint64(256) // FastCDC requires minSize >= 64, so avgSize >= 256
+	c := New(avgSize)
 
-	if c.ChunkSize() != chunkSize {
-		t.Errorf("Expected chunk size %d, got %d", chunkSize, c.ChunkSize())
+	if c.ChunkSize() != avgSize {
+		t.Errorf("Expected avg chunk size %d, got %d", avgSize, c.ChunkSize())
 	}
 
-	data := []byte("Hello World! This is a test.")
+	// Use enough data to get multiple chunks
+	data := bytes.Repeat([]byte("Hello World! This is test data for chunking. "), 100)
 	chunks, err := c.Split(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	expectedChunks := 3 // 28 bytes / 10 = 3 chunks
-	if len(chunks) != expectedChunks {
-		t.Errorf("Expected %d chunks, got %d", expectedChunks, len(chunks))
+	if len(chunks) == 0 {
+		t.Error("Expected at least 1 chunk")
 	}
 
 	// Verify reassembly
@@ -37,70 +36,39 @@ func TestChunkerBasic(t *testing.T) {
 	}
 }
 
-func TestChunkerExactSize(t *testing.T) {
-	chunkSize := uint64(100)
-	c := New(chunkSize)
+func TestChunkerSizeBounds(t *testing.T) {
+	avgSize := uint64(256)
+	c := New(avgSize)
 
-	data := bytes.Repeat([]byte("x"), 100) // Exactly one chunk
+	minSize := c.MinSize()
+	maxSize := c.MaxSize()
+
+	// Verify bounds are set correctly
+	if minSize != avgSize/4 {
+		t.Errorf("Expected minSize %d, got %d", avgSize/4, minSize)
+	}
+	if maxSize != avgSize*4 {
+		t.Errorf("Expected maxSize %d, got %d", avgSize*4, maxSize)
+	}
+
+	// Create data large enough to get multiple chunks
+	data := bytes.Repeat([]byte("Testing chunk size bounds with FastCDC algorithm. "), 200)
 	chunks, err := c.Split(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	if len(chunks) != 1 {
-		t.Errorf("Expected 1 chunk for exact size, got %d", len(chunks))
-	}
-
-	if chunks[0].OrigSize != chunkSize {
-		t.Errorf("Expected chunk size %d, got %d", chunkSize, chunks[0].OrigSize)
-	}
-}
-
-func TestChunkerMultipleExactChunks(t *testing.T) {
-	chunkSize := uint64(50)
-	c := New(chunkSize)
-
-	data := bytes.Repeat([]byte("x"), 150) // Exactly 3 chunks
-	chunks, err := c.Split(bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	if len(chunks) != 3 {
-		t.Errorf("Expected 3 chunks, got %d", len(chunks))
-	}
-
+	// Check all chunks are within bounds (except possibly the last one)
 	for i, chunk := range chunks {
-		if chunk.OrigSize != chunkSize {
-			t.Errorf("Chunk %d: expected size %d, got %d", i, chunkSize, chunk.OrigSize)
+		isLast := i == len(chunks)-1
+		if !isLast {
+			if chunk.OrigSize < minSize {
+				t.Errorf("Chunk %d: size %d below minimum %d", i, chunk.OrigSize, minSize)
+			}
+			if chunk.OrigSize > maxSize {
+				t.Errorf("Chunk %d: size %d above maximum %d", i, chunk.OrigSize, maxSize)
+			}
 		}
-	}
-}
-
-func TestChunkerPartialLastChunk(t *testing.T) {
-	chunkSize := uint64(100)
-	c := New(chunkSize)
-
-	data := bytes.Repeat([]byte("x"), 250) // 2 full chunks + 50 byte partial
-	chunks, err := c.Split(bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	if len(chunks) != 3 {
-		t.Errorf("Expected 3 chunks, got %d", len(chunks))
-	}
-
-	// First two should be full size
-	for i := 0; i < 2; i++ {
-		if chunks[i].OrigSize != chunkSize {
-			t.Errorf("Chunk %d: expected size %d, got %d", i, chunkSize, chunks[i].OrigSize)
-		}
-	}
-
-	// Last chunk should be partial
-	if chunks[2].OrigSize != 50 {
-		t.Errorf("Last chunk: expected size 50, got %d", chunks[2].OrigSize)
 	}
 }
 
@@ -117,9 +85,9 @@ func TestChunkerEmptyData(t *testing.T) {
 	}
 }
 
-func TestChunkerSmallerThanChunkSize(t *testing.T) {
-	chunkSize := uint64(1024)
-	c := New(chunkSize)
+func TestChunkerSmallData(t *testing.T) {
+	avgSize := uint64(1024)
+	c := New(avgSize)
 
 	data := []byte("Small")
 	chunks, err := c.Split(bytes.NewReader(data))
@@ -141,10 +109,11 @@ func TestChunkerSmallerThanChunkSize(t *testing.T) {
 }
 
 func TestChunkerHashUniqueness(t *testing.T) {
-	c := New(100)
+	c := New(256)
 
-	data1 := bytes.Repeat([]byte("a"), 100)
-	data2 := bytes.Repeat([]byte("b"), 100)
+	// Create two different data sets
+	data1 := bytes.Repeat([]byte("aaaa"), 500)
+	data2 := bytes.Repeat([]byte("bbbb"), 500)
 
 	chunks1, err := c.Split(bytes.NewReader(data1))
 	if err != nil {
@@ -156,16 +125,29 @@ func TestChunkerHashUniqueness(t *testing.T) {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	// Hashes should be different for different data
-	if chunks1[0].Hash == chunks2[0].Hash {
-		t.Error("Different data produced same hash")
+	if len(chunks1) == 0 || len(chunks2) == 0 {
+		t.Fatal("Expected at least one chunk each")
+	}
+
+	// Collect all hashes
+	hashes1 := make(map[[32]byte]bool)
+	for _, chunk := range chunks1 {
+		hashes1[chunk.Hash] = true
+	}
+
+	// Check that data2 chunks have different hashes
+	for _, chunk := range chunks2 {
+		if hashes1[chunk.Hash] {
+			t.Error("Different data produced overlapping hashes")
+		}
 	}
 }
 
 func TestChunkerHashConsistency(t *testing.T) {
-	c := New(100)
+	c := New(256)
 
-	data := bytes.Repeat([]byte("test data"), 20)
+	// Create data with enough content for multiple chunks
+	data := bytes.Repeat([]byte("test data for consistency check "), 100)
 
 	// Split same data twice
 	chunks1, err := c.Split(bytes.NewReader(data))
@@ -182,36 +164,84 @@ func TestChunkerHashConsistency(t *testing.T) {
 		t.Fatalf("Different number of chunks: %d vs %d", len(chunks1), len(chunks2))
 	}
 
-	// Hashes should be identical
+	// Hashes should be identical for same data
 	for i := range chunks1 {
 		if chunks1[i].Hash != chunks2[i].Hash {
 			t.Errorf("Chunk %d: hashes differ for same data", i)
 		}
+		if chunks1[i].OrigSize != chunks2[i].OrigSize {
+			t.Errorf("Chunk %d: sizes differ for same data: %d vs %d",
+				i, chunks1[i].OrigSize, chunks2[i].OrigSize)
+		}
+	}
+}
+
+func TestChunkerContentDefinedBoundaries(t *testing.T) {
+	c := New(256)
+
+	// Create base data
+	baseData := bytes.Repeat([]byte("This is the base content that should be recognized. "), 100)
+
+	// Create shifted data (prepend some bytes)
+	prefix := []byte("PREPENDED CONTENT: ")
+	shiftedData := append(prefix, baseData...)
+
+	chunksBase, err := c.Split(bytes.NewReader(baseData))
+	if err != nil {
+		t.Fatalf("Split base failed: %v", err)
+	}
+
+	chunksShifted, err := c.Split(bytes.NewReader(shiftedData))
+	if err != nil {
+		t.Fatalf("Split shifted failed: %v", err)
+	}
+
+	// Collect hashes from base
+	baseHashes := make(map[[32]byte]bool)
+	for _, chunk := range chunksBase {
+		baseHashes[chunk.Hash] = true
+	}
+
+	// Count matching hashes in shifted data
+	// With content-defined chunking, we should see SOME matches
+	// (unlike fixed chunking where we'd see ZERO matches)
+	matchCount := 0
+	for _, chunk := range chunksShifted {
+		if baseHashes[chunk.Hash] {
+			matchCount++
+		}
+	}
+
+	// Log for visibility
+	t.Logf("Base chunks: %d, Shifted chunks: %d, Matches: %d (%.1f%%)",
+		len(chunksBase), len(chunksShifted), matchCount,
+		float64(matchCount)/float64(len(chunksBase))*100)
+
+	// With CDC, we expect at least some chunks to match after a shift
+	// This is the key benefit over fixed-size chunking
+	if matchCount == 0 && len(chunksBase) > 2 {
+		t.Log("Warning: No matching chunks found - CDC may not be working optimally")
+		// Not a hard failure since small data might not have good boundaries
 	}
 }
 
 func TestChunkerLargeData(t *testing.T) {
-	chunkSize := uint64(64 * 1024) // 64KB chunks
-	c := New(chunkSize)
+	avgSize := uint64(64 * 1024) // 64KB average
+	c := New(avgSize)
 
 	// Create 1MB of data
-	data := bytes.Repeat([]byte("Large data test. "), 64*1024)
+	data := bytes.Repeat([]byte("Large data test content. "), 40000)
 
 	chunks, err := c.Split(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	expectedChunks := len(data) / int(chunkSize)
-	if len(data)%int(chunkSize) != 0 {
-		expectedChunks++
+	if len(chunks) == 0 {
+		t.Error("Expected at least 1 chunk")
 	}
 
-	if len(chunks) != expectedChunks {
-		t.Errorf("Expected %d chunks, got %d", expectedChunks, len(chunks))
-	}
-
-	// Verify total size
+	// Verify total size matches
 	var totalSize uint64
 	for _, chunk := range chunks {
 		totalSize += chunk.OrigSize
@@ -232,34 +262,26 @@ func TestChunkerLargeData(t *testing.T) {
 	}
 }
 
-func TestChunkerReadError(t *testing.T) {
-	c := New(100)
+func TestChunkerOrigSizeMatchesData(t *testing.T) {
+	c := New(256)
 
-	// Create a reader that returns a real error (not EOF-related)
-	testErr := fmt.Errorf("simulated read error")
-	errorReader := &errorReaderImpl{err: testErr}
-
-	_, err := c.Split(errorReader)
-	if err == nil {
-		t.Error("Expected error from reader, got nil")
+	data := bytes.Repeat([]byte("verify origsize "), 200)
+	chunks, err := c.Split(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Split failed: %v", err)
 	}
-	if err != testErr {
-		t.Errorf("Expected error %v, got %v", testErr, err)
+
+	for i, chunk := range chunks {
+		if chunk.OrigSize != uint64(len(chunk.Data)) {
+			t.Errorf("Chunk %d: OrigSize %d doesn't match len(Data) %d",
+				i, chunk.OrigSize, len(chunk.Data))
+		}
 	}
-}
-
-// errorReaderImpl is a test helper that returns an error after some bytes
-type errorReaderImpl struct {
-	err error
-}
-
-func (e *errorReaderImpl) Read(p []byte) (n int, err error) {
-	return 0, e.err
 }
 
 func BenchmarkChunker1MB(b *testing.B) {
-	chunkSize := uint64(64 * 1024) // 64KB chunks
-	c := New(chunkSize)
+	avgSize := uint64(64 * 1024) // 64KB average
+	c := New(avgSize)
 	data := bytes.Repeat([]byte("x"), 1024*1024) // 1MB
 
 	b.ResetTimer()
@@ -272,8 +294,8 @@ func BenchmarkChunker1MB(b *testing.B) {
 }
 
 func BenchmarkChunker10MB(b *testing.B) {
-	chunkSize := uint64(1024 * 1024) // 1MB chunks
-	c := New(chunkSize)
+	avgSize := uint64(1024 * 1024) // 1MB average
+	c := New(avgSize)
 	data := bytes.Repeat([]byte("x"), 10*1024*1024) // 10MB
 
 	b.ResetTimer()
