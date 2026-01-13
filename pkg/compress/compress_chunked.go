@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -57,6 +58,12 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 	var chunkOffsetMu sync.Mutex
 
 	if !opts.DryRun {
+		// Ensure output directory exists
+		outputDir := filepath.Dir(opts.OutputPath)
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
+		}
+
 		outFile, err := os.Create(opts.OutputPath)
 		if err != nil {
 			return fmt.Errorf("create output file: %w", err)
@@ -269,18 +276,17 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 		if err := format.WriteArchiveFooter02(writer); err != nil {
 			return fmt.Errorf("write footer: %w", err)
 		}
+
+		// Get final archive size (includes all metadata + chunk data)
+		if file, ok := writer.(*os.File); ok {
+			if fileInfo, err := file.Stat(); err == nil {
+				result.CompressedSize = uint64(fileInfo.Size())
+			}
+		}
 	}
 
 	// Update result with stats
 	result.FilesProcessed = int(processedCount.Load())
-
-	// Get compressed size from temp file or calculate it
-	if chunkDataFile != nil {
-		tempFileInfo, err := chunkDataFile.Stat()
-		if err == nil {
-			result.CompressedSize = uint64(tempFileInfo.Size())
-		}
-	}
 
 	stats := store.Stats()
 	result.TotalChunks = stats.TotalChunks

@@ -103,6 +103,12 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	var writerMu sync.Mutex
 
 	if !opts.DryRun {
+		// Ensure output directory exists
+		outputDir := filepath.Dir(opts.OutputPath)
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			return nil, fmt.Errorf("create output directory: %w", err)
+		}
+
 		outFile, err := os.Create(opts.OutputPath)
 		if err != nil {
 			return nil, fmt.Errorf("create output file: %w", err)

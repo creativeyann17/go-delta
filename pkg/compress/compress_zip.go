@@ -53,6 +53,15 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 				// Generate worker-specific ZIP filename: archive_01.zip, archive_02.zip, etc.
 				workerZipPath = fmt.Sprintf("%s_%02d.zip", baseOutputPath, workerID+1)
 
+				// Ensure output directory exists
+				outputDir := filepath.Dir(workerZipPath)
+				if err := os.MkdirAll(outputDir, 0755); err != nil {
+					errorsMu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("worker %d: create output directory: %w", workerID, err))
+					errorsMu.Unlock()
+					return
+				}
+
 				var err error
 				workerZipFile, err = os.Create(workerZipPath)
 				if err != nil {
