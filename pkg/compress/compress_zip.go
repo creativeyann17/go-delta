@@ -15,7 +15,7 @@ import (
 
 // compressToZip compresses files into multiple ZIP archives (one per thread) for true parallelism
 // Output: archive_01.zip, archive_02.zip, ..., archive_N.zip
-func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result) error {
+func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result, parallelism Parallelism) error {
 	// Prepare output path base (remove .zip extension if present)
 	baseOutputPath := opts.OutputPath
 	if strings.HasSuffix(baseOutputPath, ".zip") {
@@ -28,7 +28,13 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 	var errorsMu sync.Mutex
 
 	var wg sync.WaitGroup
-	taskCh := make(chan fileTask, totalFiles)
+
+	// Create per-worker channels with folder affinity
+	// Files from the same folder go to the same worker/ZIP for locality
+	workerChannels := make([]chan fileTask, opts.MaxThreads)
+	for i := range workerChannels {
+		workerChannels[i] = make(chan fileTask, 64)
+	}
 
 	// Track ZIP files created for later cleanup/stats
 	type zipFileInfo struct {
@@ -41,7 +47,7 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 	// Start worker goroutines - each creates its own ZIP file
 	for i := 0; i < opts.MaxThreads; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(workerID int, workerCh chan fileTask) {
 			defer wg.Done()
 
 			// Create worker-specific ZIP file
@@ -93,7 +99,7 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 				zipFilesMu.Unlock()
 			}
 
-			for task := range taskCh {
+			for task := range workerCh {
 				// Notify file start
 				if progressCb != nil {
 					progressCb(ProgressEvent{
@@ -220,16 +226,22 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 					zipFilesMu.Unlock()
 				}
 			}
-		}(i)
+		}(i, workerChannels[i])
 	}
 
-	// Feed tasks to workers (sorted by folder for locality)
-	for _, folder := range foldersToCompress {
-		for _, task := range folder.Files {
-			taskCh <- task
+	// Route files to workers based on folder hash (maintains folder locality)
+	// Files from the same folder will end up in the same ZIP archive
+	go func() {
+		for _, folder := range foldersToCompress {
+			workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
+			for _, task := range folder.Files {
+				workerChannels[workerIdx] <- task
+			}
 		}
-	}
-	close(taskCh)
+		for _, ch := range workerChannels {
+			close(ch)
+		}
+	}()
 
 	// Wait for all workers to complete
 	wg.Wait()

@@ -21,6 +21,7 @@ func init() {
 func compressCmd() *cobra.Command {
 	var inputPath, outputPath string
 	var maxThreads int
+	var parallelism string
 	var threadMemoryStr string
 	var chunkSizeStr string
 	var chunkStoreSizeStr string
@@ -108,6 +109,7 @@ func compressCmd() *cobra.Command {
 				InputPath:       inputPath,
 				OutputPath:      outputPath,
 				MaxThreads:      maxThreads,
+				Parallelism:     compress.Parallelism(parallelism),
 				MaxThreadMemory: threadMemoryKB * 1024,   // Convert KB to bytes
 				ChunkSize:       chunkSizeKB * 1024,      // Convert KB to bytes
 				ChunkStoreSize:  chunkStoreSizeKB / 1024, // Convert KB to MB (ChunkStoreSize is in MB)
@@ -140,6 +142,7 @@ func compressCmd() *cobra.Command {
 			log("  Input:       %s", opts.InputPath)
 			log("  Output:      %s", opts.OutputPath)
 			log("  Threads:     %d", opts.MaxThreads)
+			log("  Parallelism: %s", opts.Parallelism)
 			log("  Level:       %d", opts.Level)
 			if opts.MaxThreadMemory > 0 {
 				log("  Thread Mem:  %.2f MB", float64(opts.MaxThreadMemory)/(1024*1024))
@@ -196,6 +199,7 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&inputPath, "input", "i", "", "Input file or directory (required)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "Output archive file")
 	cmd.Flags().IntVarP(&maxThreads, "threads", "t", runtime.NumCPU(), "Max concurrent threads")
+	cmd.Flags().StringVarP(&parallelism, "parallelism", "p", "auto", "Parallelism strategy: auto, folder, file (auto=detect based on input structure)")
 	cmd.Flags().StringVar(&threadMemoryStr, "thread-memory", "0", "Max memory per thread (e.g. 128MB, 1GB, 0=auto ~25% RAM capped at 4GB)")
 	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Average chunk size for content-defined dedup (e.g. 64KB, 512KB, actual chunks vary 1/4x to 4x, 0=disabled)")
 	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=auto ~25% RAM, does NOT limit archive size)")

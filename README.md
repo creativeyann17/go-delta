@@ -11,6 +11,7 @@ A smart delta compression tool for backups written in Go.
 
 - **Multiple compression formats** - GDELTA (custom format with optional deduplication) or standard ZIP (universal compatibility)
 - **Content-based deduplication** - FastCDC content-defined chunking with BLAKE3 hashing (GDELTA02 format)
+- **Streaming chunking** - Process large files (GB+) with constant memory usage via callback-based chunking
 - **Human-readable sizes** - Use `64KB`, `128MB`, `2GB` instead of raw byte counts
 - **Smart memory management** - Auto-calculated thread memory with system RAM detection and safety warnings
 - **Bounded chunk store** - LRU eviction prevents memory exhaustion on large datasets

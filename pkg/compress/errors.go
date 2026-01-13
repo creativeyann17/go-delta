@@ -15,4 +15,7 @@ var (
 
 	// ErrZipNoChunking is returned when trying to use chunking with ZIP format
 	ErrZipNoChunking = errors.New("chunk-based deduplication is not supported in ZIP format")
+
+	// ErrInvalidParallelism is returned when parallelism strategy is invalid
+	ErrInvalidParallelism = errors.New("parallelism must be 'auto', 'folder', or 'file'")
 )

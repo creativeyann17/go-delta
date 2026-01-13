@@ -3,15 +3,48 @@ package compress
 
 import (
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/creativeyann17/go-delta/internal/format"
 	"github.com/klauspost/compress/zstd"
 )
+
+// resolveParallelism determines the actual parallelism strategy.
+// If auto, it analyzes the folder structure to decide.
+func resolveParallelism(parallelism Parallelism, folders []folderTask, maxThreads int) Parallelism {
+	if parallelism != ParallelismAuto {
+		return parallelism
+	}
+
+	// Count top-level folders (direct children of input root)
+	topLevelFolders := 0
+	for _, f := range folders {
+		// A top-level folder has no path separators, or is the root ("")
+		if f.FolderPath == "" || !strings.Contains(f.FolderPath, string(filepath.Separator)) {
+			topLevelFolders++
+		}
+	}
+
+	// Use folder mode if we have enough top-level folders to keep workers busy
+	// Otherwise use file mode for better parallelism
+	if topLevelFolders >= maxThreads*2 {
+		return ParallelismFolder
+	}
+	return ParallelismFile
+}
+
+// folderHash returns a consistent hash for a folder path, used to assign files to workers
+func folderHash(folderPath string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(folderPath))
+	return h.Sum64()
+}
 
 type fileTask struct {
 	AbsPath  string
@@ -23,12 +56,6 @@ type fileTask struct {
 type folderTask struct {
 	FolderPath string     // Relative folder path
 	Files      []fileTask // Files in this folder
-}
-
-type compressedFile struct {
-	RelPath        string
-	OrigSize       uint64
-	CompressedData []byte
 }
 
 // ProgressCallback is called for various progress events
@@ -78,6 +105,9 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	result.FilesTotal = totalFiles
 	result.OriginalSize = totalOrigSize
 
+	// Resolve parallelism strategy
+	resolvedParallelism := resolveParallelism(opts.Parallelism, foldersToCompress, opts.MaxThreads)
+
 	if progressCb != nil {
 		progressCb(ProgressEvent{
 			Type:       EventStart,
@@ -88,15 +118,16 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 
 	// Route to ZIP compression if UseZipFormat is enabled
 	if opts.UseZipFormat {
-		return result, compressToZip(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result)
+		return result, compressToZip(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result, resolvedParallelism)
 	}
 
 	// Route to chunked compression if ChunkSize > 0
 	if opts.ChunkSize > 0 {
-		return result, compressWithChunking(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result)
+		return result, compressWithChunking(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result, resolvedParallelism)
 	}
 
 	// Traditional GDELTA01 compression (file-level)
+	// Uses streaming through temp files to avoid memory accumulation
 
 	// Create archive file (if not dry-run)
 	var writer io.WriteSeeker
@@ -123,154 +154,214 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		}
 	}
 
-	// Process folders with worker pool
+	// Process files with worker pool
 	var totalComprSize uint64
 	var processedCount atomic.Uint32
 	var errorsMu sync.Mutex
 
 	var wg sync.WaitGroup
-	folderCh := make(chan folderTask, len(foldersToCompress))
 
-	for i := 0; i < opts.MaxThreads; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
+	// Helper function to write a single file entry with streaming from temp file
+	writeFileEntry := func(relPath string, origSize uint64, tempFilePath string, compressedSize uint64) error {
+		writerMu.Lock()
+		defer writerMu.Unlock()
 
-			// Helper function to flush compressed files to disk
-			flushToDisk := func(files []compressedFile) error {
-				if len(files) == 0 {
-					return nil
-				}
+		// Write file entry header
+		entryStart, err := format.WriteFileEntry(writer, relPath, origSize)
+		if err != nil {
+			return fmt.Errorf("write entry: %w", err)
+		}
 
-				writerMu.Lock()
-				defer writerMu.Unlock()
+		// Get data offset
+		dataStart, err := writer.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("seek: %w", err)
+		}
 
-				for _, cf := range files {
-					// Write file entry header
-					entryStart, err := format.WriteFileEntry(writer, cf.RelPath, cf.OrigSize)
-					if err != nil {
-						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: write entry: %w", cf.RelPath, err))
-						errorsMu.Unlock()
-						continue
-					}
+		// Stream compressed data from temp file
+		tempFile, err := os.Open(tempFilePath)
+		if err != nil {
+			return fmt.Errorf("open temp file: %w", err)
+		}
+		defer tempFile.Close()
 
-					// Get data offset
-					dataStart, err := writer.Seek(0, io.SeekCurrent)
-					if err != nil {
-						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: seek: %w", cf.RelPath, err))
-						errorsMu.Unlock()
-						continue
-					}
+		if _, err := io.Copy(writer, tempFile); err != nil {
+			return fmt.Errorf("copy compressed data: %w", err)
+		}
 
-					// Write compressed data
-					_, err = writer.Write(cf.CompressedData)
-					if err != nil {
-						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: write data: %w", cf.RelPath, err))
-						errorsMu.Unlock()
-						continue
-					}
+		// Update entry with compressed size and offset
+		if err := format.UpdateFileEntry(writer, entryStart, compressedSize, uint64(dataStart)); err != nil {
+			return fmt.Errorf("update entry: %w", err)
+		}
 
-					// Update entry with compressed size and offset
-					err = format.UpdateFileEntry(writer, entryStart, uint64(len(cf.CompressedData)), uint64(dataStart))
-					if err != nil {
-						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: update entry: %w", cf.RelPath, err))
-						errorsMu.Unlock()
-					}
-				}
-				return nil
+		return nil
+	}
+
+	// Worker function to process a single file task
+	// Streams compressed data to temp file to avoid memory accumulation
+	processFileTask := func(task fileTask) (tempPath string, comprSize uint64, err error) {
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:     EventFileStart,
+				FilePath: task.RelPath,
+				Total:    int64(task.OrigSize),
+			})
+		}
+
+		if opts.DryRun {
+			// Dry-run mode: just compress to discard
+			_, err := compressFileToWriter(task, io.Discard, opts.Level, progressCb)
+			if err != nil {
+				return "", 0, err
 			}
+			return "", 0, nil
+		}
 
-			for folderTask := range folderCh {
-				// Compress all files in this folder to memory (parallel work)
-				compressedFiles := make([]compressedFile, 0, len(folderTask.Files))
-				var folderComprSize uint64
+		// Create temp file for compressed data
+		tempFile, err := os.CreateTemp("", "godelta-file-*.tmp")
+		if err != nil {
+			return "", 0, fmt.Errorf("create temp file: %w", err)
+		}
+		tempPath = tempFile.Name()
 
-				for _, fileTask := range folderTask.Files {
-					if progressCb != nil {
-						progressCb(ProgressEvent{
-							Type:     EventFileStart,
-							FilePath: fileTask.RelPath,
-							Total:    int64(fileTask.OrigSize),
-						})
+		// Compress directly to temp file (streaming, no memory buffer)
+		compressedSize, err := compressFileToWriter(task, tempFile, opts.Level, progressCb)
+		tempFile.Close()
+
+		if err != nil {
+			os.Remove(tempPath)
+			return "", 0, err
+		}
+
+		return tempPath, compressedSize, nil
+	}
+
+	if resolvedParallelism == ParallelismFolder {
+		// Folder-based parallelism: workers grab whole folders
+		folderCh := make(chan folderTask, len(foldersToCompress))
+
+		for i := 0; i < opts.MaxThreads; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				for folder := range folderCh {
+					for _, task := range folder.Files {
+						tempPath, comprSize, err := processFileTask(task)
+
+						if err != nil {
+							errorsMu.Lock()
+							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+							errorsMu.Unlock()
+							if progressCb != nil {
+								progressCb(ProgressEvent{
+									Type:     EventError,
+									FilePath: task.RelPath,
+								})
+							}
+							continue
+						}
+
+						// Write to archive immediately and clean up temp file
+						if !opts.DryRun {
+							if err := writeFileEntry(task.RelPath, task.OrigSize, tempPath, comprSize); err != nil {
+								errorsMu.Lock()
+								result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+								errorsMu.Unlock()
+							}
+							os.Remove(tempPath)
+							atomic.AddUint64(&totalComprSize, comprSize)
+						}
+
+						processedCount.Add(1)
+						if progressCb != nil {
+							progressCb(ProgressEvent{
+								Type:           EventFileComplete,
+								FilePath:       task.RelPath,
+								Current:        int64(task.OrigSize),
+								Total:          int64(task.OrigSize),
+								CompressedSize: comprSize,
+							})
+						}
 					}
+				}
+			}()
+		}
 
-					var compressedData []byte
-					var err error
+		// Feed folder tasks
+		go func() {
+			for _, task := range foldersToCompress {
+				folderCh <- task
+			}
+			close(folderCh)
+		}()
+	} else {
+		// File-based parallelism: per-worker channels with folder affinity
+		// Files from the same folder go to the same worker for locality
+		workerChannels := make([]chan fileTask, opts.MaxThreads)
+		for i := range workerChannels {
+			workerChannels[i] = make(chan fileTask, 64) // Buffer some tasks per worker
+		}
 
-					if opts.DryRun {
-						// Dry-run mode: just compress to discard
-						_, err = compressFileToWriter(fileTask, io.Discard, opts.Level, progressCb)
-					} else {
-						// Compress to memory buffer
-						compressedData, err = compressFileToMemory(fileTask, opts.Level, progressCb)
-					}
+		for i := 0; i < opts.MaxThreads; i++ {
+			wg.Add(1)
+			go func(workerCh chan fileTask) {
+				defer wg.Done()
+
+				for task := range workerCh {
+					tempPath, comprSize, err := processFileTask(task)
 
 					if err != nil {
 						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", fileTask.RelPath, err))
+						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
 						errorsMu.Unlock()
 						if progressCb != nil {
 							progressCb(ProgressEvent{
 								Type:     EventError,
-								FilePath: fileTask.RelPath,
+								FilePath: task.RelPath,
 							})
 						}
 						continue
 					}
 
+					// Write to archive immediately and clean up temp file
 					if !opts.DryRun {
-						compressedFiles = append(compressedFiles, compressedFile{
-							RelPath:        fileTask.RelPath,
-							OrigSize:       fileTask.OrigSize,
-							CompressedData: compressedData,
-						})
-						folderComprSize += uint64(len(compressedData))
-
-						// Check if we should flush due to memory threshold
-						if opts.MaxThreadMemory > 0 && folderComprSize >= opts.MaxThreadMemory {
-							// Flush current batch to disk
-							flushToDisk(compressedFiles)
-							atomic.AddUint64(&totalComprSize, folderComprSize)
-
-							// Reset batch
-							compressedFiles = make([]compressedFile, 0, len(folderTask.Files))
-							folderComprSize = 0
+						if err := writeFileEntry(task.RelPath, task.OrigSize, tempPath, comprSize); err != nil {
+							errorsMu.Lock()
+							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+							errorsMu.Unlock()
 						}
+						os.Remove(tempPath)
+						atomic.AddUint64(&totalComprSize, comprSize)
 					}
 
 					processedCount.Add(1)
 					if progressCb != nil {
 						progressCb(ProgressEvent{
 							Type:           EventFileComplete,
-							FilePath:       fileTask.RelPath,
-							Current:        int64(fileTask.OrigSize),
-							Total:          int64(fileTask.OrigSize),
-							CompressedSize: uint64(len(compressedData)),
+							FilePath:       task.RelPath,
+							Current:        int64(task.OrigSize),
+							Total:          int64(task.OrigSize),
+							CompressedSize: comprSize,
 						})
 					}
 				}
-
-				// Final flush for remaining files in this folder
-				if !opts.DryRun && len(compressedFiles) > 0 {
-					flushToDisk(compressedFiles)
-				}
-
-				atomic.AddUint64(&totalComprSize, folderComprSize)
-			}
-		}(i + 1)
-	}
-
-	// Feed folder tasks
-	go func() {
-		for _, task := range foldersToCompress {
-			folderCh <- task
+			}(workerChannels[i])
 		}
-		close(folderCh)
-	}()
+
+		// Route files to workers based on folder hash (maintains folder locality)
+		go func() {
+			for _, folder := range foldersToCompress {
+				workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
+				for _, task := range folder.Files {
+					workerChannels[workerIdx] <- task
+				}
+			}
+			for _, ch := range workerChannels {
+				close(ch)
+			}
+		}()
+	}
 
 	wg.Wait()
 
@@ -297,65 +388,7 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	return result, nil
 }
 
-// compressFileToMemory compresses a file to a memory buffer and returns the compressed data
-func compressFileToMemory(
-	task fileTask,
-	level int,
-	progressCb ProgressCallback,
-) ([]byte, error) {
-	src, err := os.Open(task.AbsPath)
-	if err != nil {
-		return nil, fmt.Errorf("open source file: %w", err)
-	}
-	defer src.Close()
-
-	// Create buffer to hold compressed data
-	var buf []byte
-	bufWriter := &bytesWriter{data: &buf}
-
-	// Create zstd encoder
-	enc, err := zstd.NewWriter(bufWriter,
-		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
-		zstd.WithZeroFrames(true),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create zstd writer: %w", err)
-	}
-
-	// Progress tracking reader
-	uncompressedRead := uint64(0)
-	proxy := &progressReader{
-		Reader: src,
-		onRead: func(n int) {
-			uncompressedRead += uint64(n)
-			if progressCb != nil {
-				progressCb(ProgressEvent{
-					Type:         EventFileProgress,
-					FilePath:     task.RelPath,
-					Current:      int64(uncompressedRead),
-					Total:        int64(task.OrigSize),
-					CurrentBytes: uncompressedRead,
-				})
-			}
-		},
-	}
-
-	// Perform compression
-	_, err = io.Copy(enc, proxy)
-	if err != nil {
-		enc.Close()
-		return nil, fmt.Errorf("copy/compress failed: %w", err)
-	}
-
-	// Flush and close encoder
-	if err = enc.Close(); err != nil {
-		return nil, fmt.Errorf("close zstd encoder: %w", err)
-	}
-
-	return buf, nil
-}
-
-// compressFileToWriter compresses a file directly to a writer (for dry-run mode)
+// compressFileToWriter compresses a file directly to a writer
 func compressFileToWriter(
 	task fileTask,
 	writer io.Writer,
@@ -417,15 +450,6 @@ func compressFileToWriter(
 	}
 
 	return compressedBytes, nil
-}
-
-type bytesWriter struct {
-	data *[]byte
-}
-
-func (bw *bytesWriter) Write(p []byte) (n int, err error) {
-	*bw.data = append(*bw.data, p...)
-	return len(p), nil
 }
 
 type progressWriter struct {

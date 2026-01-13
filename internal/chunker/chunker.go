@@ -36,6 +36,9 @@ type Chunk struct {
 // Returns all chunks with their BLAKE3 hashes.
 // Chunk boundaries are determined by content patterns, not fixed positions,
 // which enables effective deduplication even when data is shifted.
+//
+// WARNING: For large files, this loads all chunks into memory at once.
+// Consider using SplitWithCallback for streaming processing.
 func (c *Chunker) Split(reader io.Reader) ([]Chunk, error) {
 	opts := fastcdc.Options{
 		AverageSize: int(c.avgSize),
@@ -74,6 +77,56 @@ func (c *Chunker) Split(reader io.Reader) ([]Chunk, error) {
 	}
 
 	return chunks, nil
+}
+
+// ChunkCallback is called for each chunk during streaming processing.
+// Return an error to abort chunking.
+type ChunkCallback func(chunk Chunk) error
+
+// SplitWithCallback reads from reader and processes chunks via callback.
+// This enables streaming processing without loading entire file into memory.
+// The chunk.Data slice is only valid during the callback - copy if needed.
+func (c *Chunker) SplitWithCallback(reader io.Reader, callback ChunkCallback) error {
+	opts := fastcdc.Options{
+		AverageSize: int(c.avgSize),
+		MinSize:     int(c.minSize),
+		MaxSize:     int(c.maxSize),
+	}
+
+	chunker, err := fastcdc.NewChunker(reader, opts)
+	if err != nil {
+		return err
+	}
+
+	for {
+		fc, err := chunker.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		// Copy data (FastCDC reuses buffer)
+		data := make([]byte, len(fc.Data))
+		copy(data, fc.Data)
+
+		// Calculate BLAKE3 hash
+		hash := blake3.Sum256(data)
+
+		chunk := Chunk{
+			Data:     data,
+			Hash:     hash,
+			OrigSize: uint64(len(data)),
+		}
+
+		// Process chunk immediately via callback
+		if err := callback(chunk); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // ChunkSize returns the configured average chunk size

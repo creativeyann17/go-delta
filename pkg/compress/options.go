@@ -6,6 +6,24 @@ import (
 	"runtime"
 )
 
+// Parallelism defines the parallelism strategy
+type Parallelism string
+
+const (
+	// ParallelismAuto auto-detects based on input structure
+	// Uses folder mode if enough folders, file mode otherwise
+	ParallelismAuto Parallelism = "auto"
+
+	// ParallelismFolder processes whole folders per worker (original behavior)
+	// Best when: many folders with few files each
+	ParallelismFolder Parallelism = "folder"
+
+	// ParallelismFile processes individual files per worker with folder affinity
+	// Files from same folder go to same worker for locality
+	// Best when: flat directories or few folders with many files
+	ParallelismFile Parallelism = "file"
+)
+
 // Options configures the compression behavior
 type Options struct {
 	// Input path (file or directory)
@@ -24,6 +42,10 @@ type Options struct {
 	// Maximum number of concurrent compression threads
 	// Default: runtime.NumCPU()
 	MaxThreads int
+
+	// Parallelism strategy: "auto", "folder", or "file"
+	// Default: "auto"
+	Parallelism Parallelism
 
 	// Maximum memory per thread before flushing to disk (bytes)
 	// 0 = unlimited (flush only at folder boundaries)
@@ -70,6 +92,7 @@ type Options struct {
 func DefaultOptions() *Options {
 	return &Options{
 		MaxThreads:      runtime.NumCPU(),
+		Parallelism:     ParallelismAuto,
 		MaxThreadMemory: 0, // Unlimited by default
 		ChunkSize:       0, // Chunking disabled by default
 		Level:           5,
@@ -89,6 +112,17 @@ func (o *Options) Validate() error {
 	}
 	if o.MaxThreads <= 0 {
 		o.MaxThreads = runtime.NumCPU()
+	}
+
+	// Validate parallelism strategy
+	if o.Parallelism == "" {
+		o.Parallelism = ParallelismAuto
+	}
+	switch o.Parallelism {
+	case ParallelismAuto, ParallelismFolder, ParallelismFile:
+		// valid
+	default:
+		return ErrInvalidParallelism
 	}
 
 	// Set default level if not specified

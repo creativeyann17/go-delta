@@ -19,7 +19,7 @@ import (
 )
 
 // compressWithChunking performs compression with chunk-level deduplication (GDELTA02)
-func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result) error {
+func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result, parallelism Parallelism) error {
 	// Calculate max chunks for bounded store
 	maxChunks := 0
 	if opts.ChunkStoreSize > 0 && opts.ChunkSize > 0 {
@@ -106,115 +106,155 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 	var errorsMu sync.Mutex
 
 	var wg sync.WaitGroup
-	folderCh := make(chan folderTask, len(filesToCompress))
 
-	for i := 0; i < opts.MaxThreads; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
+	// Worker function to process a single file task
+	processFileTask := func(task fileTask, workerID int) {
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:     EventFileStart,
+				FilePath: task.RelPath,
+				Total:    int64(task.OrigSize),
+			})
+		}
 
-			for folderTask := range folderCh {
-				for _, fileTask := range folderTask.Files {
-					if progressCb != nil {
-						progressCb(ProgressEvent{
-							Type:     EventFileStart,
-							FilePath: fileTask.RelPath,
-							Total:    int64(fileTask.OrigSize),
-						})
-					}
-
-					if opts.DryRun {
-						// Dry-run: chunk the file and track dedup stats without writing
-						file, err := os.Open(fileTask.AbsPath)
-						if err != nil {
-							errorsMu.Lock()
-							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", fileTask.RelPath, err))
-							errorsMu.Unlock()
-							continue
-						}
-						chunks, err := chunkerInstance.Split(file)
-						file.Close()
-
-						if err != nil {
-							errorsMu.Lock()
-							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", fileTask.RelPath, err))
-							errorsMu.Unlock()
-							continue
-						}
-
-						// Register chunks with store to track dedup stats
-						for _, chunk := range chunks {
-							// Estimate compressed size as 50% of original (typical for zstd)
-							estimatedComprSize := chunk.OrigSize / 2
-							if estimatedComprSize == 0 {
-								estimatedComprSize = 1
-							}
-							store.GetOrAdd(chunk.Hash, chunk.OrigSize, func() (uint64, uint64, error) {
-								// No-op writeFunc for dry-run - just return estimated values
-								chunkOffsetMu.Lock()
-								offset := currentChunkOffset
-								currentChunkOffset += estimatedComprSize
-								chunkOffsetMu.Unlock()
-								return offset, estimatedComprSize, nil
-							})
-						}
-					} else {
-						// Real compression with chunking
-						metadata, err := compressFileChunked(
-							fileTask,
-							chunkerInstance,
-							store,
-							chunkDataWriter,
-							&chunkOffsetMu,
-							&currentChunkOffset,
-							opts.Level,
-							progressCb,
-						)
-
-						if err != nil {
-							errorsMu.Lock()
-							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", fileTask.RelPath, err))
-							errorsMu.Unlock()
-							if progressCb != nil {
-								progressCb(ProgressEvent{
-									Type:     EventError,
-									FilePath: fileTask.RelPath,
-								})
-							}
-							continue
-						}
-
-						if opts.Verbose && len(metadata.ChunkHashes) > 0 {
-							fmt.Printf("  [Worker %d] %s: %d chunks\n", workerID, fileTask.RelPath, len(metadata.ChunkHashes))
-						}
-
-						// Store file metadata
-						metadataMu.Lock()
-						fileMetadataList = append(fileMetadataList, metadata)
-						metadataMu.Unlock()
-					}
-
-					processedCount.Add(1)
-					if progressCb != nil {
-						progressCb(ProgressEvent{
-							Type:     EventFileComplete,
-							FilePath: fileTask.RelPath,
-							Current:  int64(fileTask.OrigSize),
-							Total:    int64(fileTask.OrigSize),
-						})
-					}
-				}
+		if opts.DryRun {
+			// Dry-run: chunk the file and track dedup stats without writing
+			file, err := os.Open(task.AbsPath)
+			if err != nil {
+				errorsMu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+				errorsMu.Unlock()
+				return
 			}
-		}(i + 1)
+
+			// Use streaming callback to avoid loading all chunks into memory
+			err = chunkerInstance.SplitWithCallback(file, func(chunk chunker.Chunk) error {
+				// Estimate compressed size as 50% of original (typical for zstd)
+				estimatedComprSize := chunk.OrigSize / 2
+				if estimatedComprSize == 0 {
+					estimatedComprSize = 1
+				}
+				_, _, err := store.GetOrAdd(chunk.Hash, chunk.OrigSize, func() (uint64, uint64, error) {
+					// No-op writeFunc for dry-run - just return estimated values
+					chunkOffsetMu.Lock()
+					offset := currentChunkOffset
+					currentChunkOffset += estimatedComprSize
+					chunkOffsetMu.Unlock()
+					return offset, estimatedComprSize, nil
+				})
+				return err
+			})
+			file.Close()
+
+			if err != nil {
+				errorsMu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+				errorsMu.Unlock()
+				return
+			}
+		} else {
+			// Real compression with chunking
+			metadata, err := compressFileChunked(
+				task,
+				chunkerInstance,
+				store,
+				chunkDataWriter,
+				&chunkOffsetMu,
+				&currentChunkOffset,
+				opts.Level,
+				progressCb,
+			)
+
+			if err != nil {
+				errorsMu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+				errorsMu.Unlock()
+				if progressCb != nil {
+					progressCb(ProgressEvent{
+						Type:     EventError,
+						FilePath: task.RelPath,
+					})
+				}
+				return
+			}
+
+			if opts.Verbose && len(metadata.ChunkHashes) > 0 {
+				fmt.Printf("  [Worker %d] %s: %d chunks\n", workerID, task.RelPath, len(metadata.ChunkHashes))
+			}
+
+			// Store file metadata
+			metadataMu.Lock()
+			fileMetadataList = append(fileMetadataList, metadata)
+			metadataMu.Unlock()
+		}
+
+		processedCount.Add(1)
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:     EventFileComplete,
+				FilePath: task.RelPath,
+				Current:  int64(task.OrigSize),
+				Total:    int64(task.OrigSize),
+			})
+		}
 	}
 
-	// Feed folder tasks
-	go func() {
-		for _, task := range filesToCompress {
-			folderCh <- task
+	if parallelism == ParallelismFolder {
+		// Folder-based parallelism: workers grab whole folders
+		folderCh := make(chan folderTask, len(filesToCompress))
+
+		for i := 0; i < opts.MaxThreads; i++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+
+				for folder := range folderCh {
+					for _, task := range folder.Files {
+						processFileTask(task, workerID)
+					}
+				}
+			}(i + 1)
 		}
-		close(folderCh)
-	}()
+
+		// Feed folder tasks
+		go func() {
+			for _, task := range filesToCompress {
+				folderCh <- task
+			}
+			close(folderCh)
+		}()
+	} else {
+		// File-based parallelism: per-worker channels with folder affinity
+		// Files from the same folder go to the same worker for locality
+		workerChannels := make([]chan fileTask, opts.MaxThreads)
+		for i := range workerChannels {
+			workerChannels[i] = make(chan fileTask, 64)
+		}
+
+		for i := 0; i < opts.MaxThreads; i++ {
+			wg.Add(1)
+			go func(workerID int, workerCh chan fileTask) {
+				defer wg.Done()
+
+				for task := range workerCh {
+					processFileTask(task, workerID)
+				}
+			}(i+1, workerChannels[i])
+		}
+
+		// Route files to workers based on folder hash (maintains folder locality)
+		go func() {
+			for _, folder := range filesToCompress {
+				workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
+				for _, task := range folder.Files {
+					workerChannels[workerIdx] <- task
+				}
+			}
+			for _, ch := range workerChannels {
+				close(ch)
+			}
+		}()
+	}
 
 	wg.Wait()
 
@@ -320,6 +360,7 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 }
 
 // compressFileChunked compresses a file using chunking and deduplication
+// Uses streaming processing to avoid loading entire file into memory
 func compressFileChunked(
 	task fileTask,
 	chunkerInstance *chunker.Chunker,
@@ -337,17 +378,12 @@ func compressFileChunked(
 	}
 	defer file.Close()
 
-	// Split into chunks
-	chunks, err := chunkerInstance.Split(file)
-	if err != nil {
-		return format.FileMetadata{}, fmt.Errorf("split chunks: %w", err)
-	}
-
-	// Process each chunk
-	chunkHashes := make([][32]byte, 0, len(chunks))
+	// Process chunks via streaming callback
+	chunkHashes := make([][32]byte, 0, 8)
 	bytesRead := uint64(0)
+	var chunkErr error
 
-	for _, chunk := range chunks {
+	err = chunkerInstance.SplitWithCallback(file, func(chunk chunker.Chunk) error {
 		bytesRead += chunk.OrigSize
 
 		// Report progress
@@ -404,7 +440,8 @@ func compressFileChunked(
 		})
 
 		if err != nil {
-			return format.FileMetadata{}, fmt.Errorf("process chunk: %w", err)
+			chunkErr = fmt.Errorf("process chunk: %w", err)
+			return chunkErr
 		}
 
 		if isNew {
@@ -414,6 +451,11 @@ func compressFileChunked(
 		}
 
 		chunkHashes = append(chunkHashes, chunkInfo.Hash)
+		return nil
+	})
+
+	if err != nil {
+		return format.FileMetadata{}, fmt.Errorf("split chunks: %w", err)
 	}
 
 	return format.FileMetadata{
