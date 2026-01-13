@@ -61,7 +61,7 @@ func (s *Store) GetOrAdd(hash [32]byte, origSize uint64, writeFunc func() (offse
 	// Always count total chunks processed
 	s.totalChunks.Add(1)
 
-	// Fast path: check if chunk exists (read lock)
+	// Fast path: check if chunk exists in LRU cache (read lock)
 	s.mu.RLock()
 	if entry, exists := s.chunks[hash]; exists {
 		info := entry.info
@@ -78,9 +78,18 @@ func (s *Store) GetOrAdd(hash [32]byte, origSize uint64, writeFunc func() (offse
 		s.bytesSaved.Add(info.CompressedSize)
 		return info, false, nil
 	}
+
+	// Check if chunk exists in permanent index (evicted from LRU but data already in archive)
+	if info, exists := s.allChunks[hash]; exists {
+		s.mu.RUnlock()
+
+		s.dedupedChunks.Add(1)
+		s.bytesSaved.Add(info.CompressedSize)
+		return info, false, nil
+	}
 	s.mu.RUnlock()
 
-	// Chunk doesn't exist, write it
+	// Chunk doesn't exist anywhere, write it
 	offset, comprSize, err := writeFunc()
 	if err != nil {
 		return ChunkInfo{}, false, err
@@ -99,13 +108,18 @@ func (s *Store) GetOrAdd(hash [32]byte, origSize uint64, writeFunc func() (offse
 
 	// Double-check in case another goroutine added it
 	if entry, exists := s.chunks[hash]; exists {
-		// Another goroutine added it, use that one
+		// Another goroutine added it to LRU cache, use that one
 		entry.refCount++
 		s.lruList.MoveToFront(entry.lruNode)
 		s.dedupedChunks.Add(1)
-		// Track compressed bytes saved, not original bytes
 		s.bytesSaved.Add(entry.info.CompressedSize)
 		return entry.info, false, nil
+	}
+	if existingInfo, exists := s.allChunks[hash]; exists {
+		// Another goroutine added it to permanent index, use that one
+		s.dedupedChunks.Add(1)
+		s.bytesSaved.Add(existingInfo.CompressedSize)
+		return existingInfo, false, nil
 	}
 
 	// Add to permanent index (never evicted)

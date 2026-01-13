@@ -124,7 +124,7 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 					}
 
 					if opts.DryRun {
-						// Dry-run: just chunk the file without storing
+						// Dry-run: chunk the file and track dedup stats without writing
 						file, err := os.Open(fileTask.AbsPath)
 						if err != nil {
 							errorsMu.Lock()
@@ -142,9 +142,21 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 							continue
 						}
 
-						// Just count chunks for dry-run
-						for range chunks {
-							store.Stats() // Trigger counter increment
+						// Register chunks with store to track dedup stats
+						for _, chunk := range chunks {
+							// Estimate compressed size as 50% of original (typical for zstd)
+							estimatedComprSize := chunk.OrigSize / 2
+							if estimatedComprSize == 0 {
+								estimatedComprSize = 1
+							}
+							store.GetOrAdd(chunk.Hash, chunk.OrigSize, func() (uint64, uint64, error) {
+								// No-op writeFunc for dry-run - just return estimated values
+								chunkOffsetMu.Lock()
+								offset := currentChunkOffset
+								currentChunkOffset += estimatedComprSize
+								chunkOffsetMu.Unlock()
+								return offset, estimatedComprSize, nil
+							})
 						}
 					} else {
 						// Real compression with chunking

@@ -593,3 +593,58 @@ func BenchmarkChunkedVsNonChunked(b *testing.B) {
 		}
 	})
 }
+
+func TestDryRunDedupStats(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Create files with duplicate content
+	content := bytes.Repeat([]byte("ABCDEFGHIJ"), 10000) // 100KB of repeated content
+	if err := os.WriteFile(filepath.Join(tempDir, "file1.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "file2.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "file3.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dry-run with chunking
+	opts := &Options{
+		InputPath:  tempDir,
+		OutputPath: filepath.Join(tempDir, "test.gdelta"),
+		ChunkSize:  64 * 1024, // 64KB chunks
+		DryRun:     true,
+		MaxThreads: 1, // Single thread for predictable results
+	}
+
+	result, err := Compress(opts, nil)
+	if err != nil {
+		t.Fatalf("Dry-run failed: %v", err)
+	}
+
+	// Should have deduplication stats
+	if result.TotalChunks == 0 {
+		t.Error("TotalChunks should be > 0")
+	}
+
+	// With 3 identical files, we should see deduplication
+	// Files 2 and 3 should deduplicate against file 1's chunks
+	if result.DedupedChunks == 0 {
+		t.Error("DedupedChunks should be > 0 for identical files")
+	}
+
+	// Dedup ratio should be significant (at least 50% since 2/3 files are duplicates)
+	dedupRatio := float64(result.DedupedChunks) / float64(result.TotalChunks) * 100
+	if dedupRatio < 50 {
+		t.Errorf("Expected dedup ratio >= 50%%, got %.1f%%", dedupRatio)
+	}
+
+	t.Logf("Dry-run stats: %d total, %d unique, %d deduped (%.1f%% ratio)",
+		result.TotalChunks, result.UniqueChunks, result.DedupedChunks, dedupRatio)
+
+	// Verify no archive was created
+	if _, err := os.Stat(opts.OutputPath); !os.IsNotExist(err) {
+		t.Error("Dry-run should not create archive file")
+	}
+}

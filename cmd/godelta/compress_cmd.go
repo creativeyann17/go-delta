@@ -4,8 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -87,40 +85,22 @@ func compressCmd() *cobra.Command {
 				}
 			}
 
-			// If thread-memory is 0, calculate it from total input size
+			// Auto-calculate thread memory if not specified
 			if threadMemoryKB == 0 {
-				// Quick scan to get total file size
-				var totalSize uint64
-				filepath.Walk(inputPath, func(path string, info os.FileInfo, err error) error {
-					if err == nil && info.Mode().IsRegular() {
-						totalSize += uint64(info.Size())
-					}
-					return nil
-				})
-
-				if totalSize > 0 {
-					// Divide total size by thread count, convert to KB, add small buffer
-					perThreadBytes := totalSize / uint64(maxThreads)
-					threadMemoryKB = (perThreadBytes / 1024) + (50 * 1024) // +50MB buffer
-					if !quiet {
-						log("Auto-calculated thread memory: %.2f MB per thread (total input: %.2f MiB / %d threads)",
-							float64(threadMemoryKB)/1024, float64(totalSize)/(1024*1024), maxThreads)
-					}
+				threadMemoryKB = autoSizeFromSystemMemory(totalSystemMemoryKB)
+				if threadMemoryKB > 0 {
+					log("Auto-calculated thread memory: %.0f MB (%d%% of system memory, capped at %.0f GB)",
+						float64(threadMemoryKB)/1024, autoSizePercent, float64(autoSizeMaxKB)/(1024*1024))
 				}
 			}
 
-			// Memory safety check for --thread-memory
-			if threadMemoryKB > 0 {
-				totalMemoryKB := uint64(maxThreads) * threadMemoryKB
-
-				// System memory detected successfully
-				if totalMemoryKB > totalSystemMemoryKB {
-					log("WARNING: Total thread memory (%d threads × %.2f MB = %.2f MB) exceeds system memory (%.2f MB)",
-						maxThreads, float64(threadMemoryKB)/1024, float64(totalMemoryKB)/1024, float64(totalSystemMemoryKB)/1024)
-					log("         This may cause memory exhaustion. Consider reducing --thread-memory or --threads")
-					log("")
+			// Auto-calculate chunk store size if chunking is enabled but store size not specified
+			if chunkSizeKB > 0 && chunkStoreSizeKB == 0 {
+				chunkStoreSizeKB = autoSizeFromSystemMemory(totalSystemMemoryKB)
+				if chunkStoreSizeKB > 0 {
+					log("Auto-calculated chunk store size: %.0f MB (%d%% of system memory, capped at %.0f GB)",
+						float64(chunkStoreSizeKB)/1024, autoSizePercent, float64(autoSizeMaxKB)/(1024*1024))
 				}
-
 			}
 
 			// Prepare options
@@ -216,9 +196,9 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&inputPath, "input", "i", "", "Input file or directory (required)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "Output archive file")
 	cmd.Flags().IntVarP(&maxThreads, "threads", "t", runtime.NumCPU(), "Max concurrent threads")
-	cmd.Flags().StringVar(&threadMemoryStr, "thread-memory", "0", "Max memory per thread (e.g. 128MB, 1GB, 0=auto)")
+	cmd.Flags().StringVar(&threadMemoryStr, "thread-memory", "0", "Max memory per thread (e.g. 128MB, 1GB, 0=auto ~25% RAM capped at 4GB)")
 	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Average chunk size for content-defined dedup (e.g. 64KB, 512KB, actual chunks vary 1/4x to 4x, 0=disabled)")
-	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=unlimited, does NOT limit archive size)")
+	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=auto ~25% RAM, does NOT limit archive size)")
 	cmd.Flags().BoolVar(&useZipFormat, "zip", false, "Create standard ZIP archive instead of GDELTA format (universally compatible)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Simulate without writing anything")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")
@@ -289,7 +269,29 @@ const (
 	// Minimum chunk size should be at least 16x this overhead = ~1.4 KB
 	// Setting minimum to 4 KB provides safe margin for meaningful deduplication
 	minChunkSizeKB = 4
+
+	// Auto-size calculation constants (in KB)
+	autoSizeMaxKB   = 4 * 1024 * 1024 // 4GB cap
+	autoSizeMinKB   = 256 * 1024      // 256MB minimum
+	autoSizePercent = 25              // Use 25% of system memory
 )
+
+// autoSizeFromSystemMemory calculates a bounded size based on system memory.
+// Returns size in KB: 25% of system RAM, capped at 4GB, minimum 256MB.
+// Returns 0 if systemMemoryKB is 0 (unknown).
+func autoSizeFromSystemMemory(systemMemoryKB uint64) uint64 {
+	if systemMemoryKB == 0 {
+		return 0
+	}
+	sizeKB := systemMemoryKB * autoSizePercent / 100
+	if sizeKB > autoSizeMaxKB {
+		sizeKB = autoSizeMaxKB
+	}
+	if sizeKB < autoSizeMinKB {
+		sizeKB = autoSizeMinKB
+	}
+	return sizeKB
+}
 
 // getTotalSystemMemory is implemented in platform-specific files:
 // - sysmem_linux.go (Linux)

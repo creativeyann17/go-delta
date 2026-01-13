@@ -212,6 +212,63 @@ func TestBoundedStoreEvictionStats(t *testing.T) {
 	}
 }
 
+func TestBoundedStoreDedupAfterEviction(t *testing.T) {
+	// Create store with capacity of 2 chunks
+	store := NewStoreWithCapacity(2)
+
+	hash0 := [32]byte{0}
+	hash1 := [32]byte{1}
+	hash2 := [32]byte{2}
+
+	// Add chunks 0 and 1
+	info0, _, _ := store.GetOrAdd(hash0, 100, func() (uint64, uint64, error) {
+		return 0, 50, nil
+	})
+	store.GetOrAdd(hash1, 100, func() (uint64, uint64, error) {
+		return 100, 60, nil
+	})
+
+	// Add chunk 2 - should evict chunk 0 (LRU)
+	store.GetOrAdd(hash2, 100, func() (uint64, uint64, error) {
+		return 200, 70, nil
+	})
+
+	// Verify chunk 0 is evicted from LRU cache
+	_, exists := store.Get(hash0)
+	if exists {
+		t.Error("Chunk 0 should have been evicted from LRU cache")
+	}
+
+	// Now try to add chunk 0 again - should deduplicate WITHOUT calling writeFunc
+	writeCalled := false
+	info0Again, isNew, err := store.GetOrAdd(hash0, 100, func() (uint64, uint64, error) {
+		writeCalled = true
+		return 999, 999, nil // These values should NOT be used
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writeCalled {
+		t.Error("writeFunc should NOT be called - chunk should be found in allChunks")
+	}
+	if isNew {
+		t.Error("Chunk 0 should NOT be new - it was already in allChunks")
+	}
+	if info0Again.Offset != info0.Offset {
+		t.Errorf("Expected offset %d, got %d", info0.Offset, info0Again.Offset)
+	}
+	if info0Again.CompressedSize != info0.CompressedSize {
+		t.Errorf("Expected compressed size %d, got %d", info0.CompressedSize, info0Again.CompressedSize)
+	}
+
+	// Check stats - should show deduplication
+	stats := store.Stats()
+	if stats.DedupedChunks != 1 {
+		t.Errorf("Expected 1 deduped chunk, got %d", stats.DedupedChunks)
+	}
+}
+
 func BenchmarkBoundedStoreWithEviction(b *testing.B) {
 	store := NewStoreWithCapacity(100)
 
