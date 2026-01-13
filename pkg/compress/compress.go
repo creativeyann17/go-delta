@@ -452,85 +452,102 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 // Returns folder tasks, total file count, total size, and any error
 func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, error) {
 	folderMap := make(map[string][]fileTask)
+	seenRelPaths := make(map[string]string) // relPath -> original source (for overlap detection)
 	var totalOrigSize uint64
 	var totalFiles int
-	var baseDir string
 
-	// Determine base directory for relative paths
-	if len(opts.Files) > 0 {
-		// Find common base path for all input files/directories
-		baseDir = findCommonBasePath(opts.Files)
-	} else {
-		baseDir = opts.InputPath
+	// Function to add a file task with overlap checking
+	addFile := func(absPath, relPath string, info os.FileInfo, source string) error {
+		// Check for overlapping relative paths
+		if existingSource, exists := seenRelPaths[relPath]; exists {
+			return fmt.Errorf("path overlap: %q from %q conflicts with %q", relPath, source, existingSource)
+		}
+		seenRelPaths[relPath] = source
+
+		// Group by immediate parent folder
+		folderPath := filepath.Dir(relPath)
+		if folderPath == "." {
+			folderPath = "" // Root level files
+		}
+
+		task := fileTask{
+			AbsPath:  absPath,
+			RelPath:  relPath,
+			Info:     info,
+			OrigSize: uint64(info.Size()),
+		}
+
+		folderMap[folderPath] = append(folderMap[folderPath], task)
+		totalOrigSize += uint64(info.Size())
+		totalFiles++
+		return nil
 	}
 
-	// Function to process a single path (file or directory)
-	processPath := func(inputPath string) error {
-		return filepath.Walk(inputPath, func(path string, info os.FileInfo, err error) error {
+	if len(opts.Files) > 0 {
+		// Custom file list mode: use paths as provided by the user
+		for _, inputPath := range opts.Files {
+			cleanPath := filepath.Clean(inputPath)
+			info, err := os.Stat(cleanPath)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", inputPath, err))
+				continue
+			}
+
+			if info.IsDir() {
+				// Walk directory, paths are relative to this directory
+				dirBase := filepath.Base(cleanPath)
+				err := filepath.Walk(cleanPath, func(path string, finfo os.FileInfo, err error) error {
+					if err != nil {
+						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", path, err))
+						return nil
+					}
+					if finfo.IsDir() || !finfo.Mode().IsRegular() {
+						return nil
+					}
+
+					// RelPath = dirBase + path relative to cleanPath
+					relToDir, _ := filepath.Rel(cleanPath, path)
+					relPath := filepath.Join(dirBase, relToDir)
+
+					if err := addFile(path, relPath, finfo, inputPath); err != nil {
+						return err
+					}
+					return nil
+				})
+				if err != nil {
+					return nil, 0, 0, err
+				}
+			} else if info.Mode().IsRegular() {
+				// Single file: use just the filename
+				relPath := filepath.Base(cleanPath)
+				if err := addFile(cleanPath, relPath, info, inputPath); err != nil {
+					return nil, 0, 0, err
+				}
+			}
+		}
+	} else {
+		// InputPath mode: walk and use paths relative to InputPath
+		baseDir := opts.InputPath
+		err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", path, err))
-				return nil // continue
+				return nil
 			}
 			if info.IsDir() || !info.Mode().IsRegular() {
 				return nil
 			}
 
-			// Calculate relative path from base directory
 			relPath, err := filepath.Rel(baseDir, path)
 			if err != nil {
-				// If relative path calculation fails, try using path relative to input
-				relPath, err = filepath.Rel(inputPath, path)
-				if err != nil {
-					// As last resort, use just the filename
-					relPath = filepath.Base(path)
-				}
+				relPath = filepath.Base(path)
 			}
 
-			// If relPath starts with "..", we're outside the base - use absolute structure
-			// This shouldn't happen with proper common base calculation, but handle it gracefully
-			if len(relPath) >= 2 && relPath[0:2] == ".." {
-				// Strip leading "../" and use the remainder
-				relPath = filepath.Base(inputPath)
-				if info.Name() != filepath.Base(inputPath) {
-					// It's a file inside the input directory
-					subPath, _ := filepath.Rel(inputPath, path)
-					if subPath != "" && subPath != "." {
-						relPath = filepath.Join(relPath, subPath)
-					}
-				}
+			if err := addFile(path, relPath, info, baseDir); err != nil {
+				return err
 			}
-
-			// Group by immediate parent folder
-			folderPath := filepath.Dir(relPath)
-			if folderPath == "." {
-				folderPath = "" // Root level files
-			}
-
-			task := fileTask{
-				AbsPath:  path,
-				RelPath:  relPath,
-				Info:     info,
-				OrigSize: uint64(info.Size()),
-			}
-
-			folderMap[folderPath] = append(folderMap[folderPath], task)
-			totalOrigSize += uint64(info.Size())
-			totalFiles++
 			return nil
 		})
-	}
-
-	// Process either custom Files list or InputPath
-	if len(opts.Files) > 0 {
-		// Use custom file list
-		for _, path := range opts.Files {
-			if err := processPath(path); err != nil {
-				return nil, 0, 0, fmt.Errorf("processing %s: %w", path, err)
-			}
-		}
-	} else {
-		// Use InputPath
-		if err := processPath(opts.InputPath); err != nil {
+		if err != nil {
 			return nil, 0, 0, fmt.Errorf("directory walk failed: %w", err)
 		}
 	}
@@ -545,84 +562,4 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 	}
 
 	return foldersToCompress, totalFiles, totalOrigSize, nil
-}
-
-// findCommonBasePath finds the deepest common directory path for a list of file/directory paths
-func findCommonBasePath(paths []string) string {
-	if len(paths) == 0 {
-		return "."
-	}
-
-	// Convert all paths to absolute and clean them (no I/O)
-	absPaths := make([]string, len(paths))
-	for i, p := range paths {
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			abs = p
-		}
-		absPaths[i] = filepath.Clean(abs)
-	}
-
-	if len(absPaths) == 1 {
-		// For single path, just use its directory
-		// We don't need to stat to check if it's a directory - the caller
-		// will handle the actual file operations
-		return filepath.Dir(absPaths[0])
-	}
-
-	// Split first path into components
-	commonParts := splitPath(absPaths[0])
-
-	// Find common prefix with all other paths
-	for _, path := range absPaths[1:] {
-		parts := splitPath(path)
-
-		// Find where they diverge
-		minLen := len(commonParts)
-		if len(parts) < minLen {
-			minLen = len(parts)
-		}
-
-		divergeAt := 0
-		for i := 0; i < minLen; i++ {
-			if commonParts[i] != parts[i] {
-				break
-			}
-			divergeAt = i + 1
-		}
-
-		commonParts = commonParts[:divergeAt]
-		if len(commonParts) == 0 {
-			break
-		}
-	}
-
-	// Reconstruct path from common parts
-	if len(commonParts) == 0 {
-		return "."
-	}
-
-	return filepath.Join(commonParts...)
-}
-
-// splitPath splits a path into its directory components
-func splitPath(path string) []string {
-	path = filepath.Clean(path)
-	var parts []string
-
-	for {
-		dir, file := filepath.Split(path)
-		if file != "" {
-			parts = append([]string{file}, parts...)
-		}
-		if dir == "" || dir == "/" || dir == "." {
-			if dir == "/" {
-				parts = append([]string{"/"}, parts...)
-			}
-			break
-		}
-		path = filepath.Clean(dir)
-	}
-
-	return parts
 }
