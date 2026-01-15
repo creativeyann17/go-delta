@@ -1,4 +1,4 @@
-.PHONY: all build build-all clean test fmt run tidy dev install-hooks
+.PHONY: all build build-all clean test bench fmt run tidy dev install-hooks
 
 # Binary name
 BINARY_NAME=godelta
@@ -41,6 +41,9 @@ clean:
 
 test: install
 	go test ./... -v
+
+bench: install
+	go test ./... -bench=. -benchmem
 
 fmt:
 	go fmt ./...

@@ -25,6 +25,7 @@ A smart delta compression tool for backups written in Go.
 - **Subdirectory support** - Recursively compress directory structures
 - **Custom file selection** - Library API supports custom file/folder lists (independent of directory structure)
 - **Progress visualization** - Multi-bar progress tracking for concurrent operations
+- **Archive verification** - Structural and data integrity validation for GDELTA01, GDELTA02, and ZIP formats
 - **CLI and Library** - Use as a command-line tool or Go library
 - **Compress & Decompress** - Full round-trip support with integrity validation
 - **Overwrite protection** - Safe decompression with optional overwrite mode
@@ -123,6 +124,66 @@ godelta decompress -i backup.delta -o /restore/path --overwrite
 godelta decompress -i backup.delta -o /restore/path --verbose
 ```
 
+### Verify archives
+
+Verify archive integrity without extracting files. Supports GDELTA01, GDELTA02, and ZIP formats.
+
+```bash
+# Quick structural validation (fast)
+godelta verify -i backup.delta
+
+# Full data integrity check (slower, decompresses all data)
+godelta verify -i backup.delta --data
+
+# Verbose output with detailed information
+godelta verify -i backup.delta --data --verbose
+
+# Minimal output (only shows final result)
+godelta verify -i backup.delta --quiet
+```
+
+**What gets verified:**
+- **Structural validation** (default, fast):
+  - Header magic bytes and format
+  - File count and metadata
+  - Chunk index integrity (GDELTA02)
+  - Footer marker
+  - Duplicate path detection
+  - Orphaned/missing chunks (GDELTA02)
+
+- **Data integrity** (with `--data` flag):
+  - All structural checks above
+  - Decompress all data to validate
+  - Size verification (decompressed vs expected)
+  - Chunk decompression (GDELTA02)
+  - Reports corrupt files/chunks
+
+**Exit codes:**
+- `0` - Archive is valid
+- `1` - Archive has errors or validation failed
+
+**Example output:**
+```
+Verifying archive: backup.delta
+Mode: Structural validation only
+
+  Progress: 1234/1234 files
+
+Archive: backup.delta [VALID]
+Format:  GDELTA02
+Size:    2.45 GB
+Files:   1234
+Original:   5.12 GB
+Compressed: 2.45 GB (47.9% ratio)
+Saved:      2.67 GB (52.1%)
+
+Chunk Info:
+  Chunk Size:  64.00 KB
+  Unique:      38452 chunks
+  References:  78903 total
+  Dedup Ratio: 51.3%
+```
+
 ### Compress Options
 
 - `-i, --input`: Input file or directory (required)
@@ -153,6 +214,15 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 - `--quiet`: Minimal output
 
 **Note**: Decompression automatically detects the archive format (GDELTA01, GDELTA02, or ZIP) by reading the file signature.
+
+### Verify Options
+
+- `-i, --input`: Input archive file to verify (required)
+- `--data`: Perform full data integrity check by decompressing all content (default: false)
+- `--verbose`: Show detailed progress and file-by-file verification
+- `--quiet`: Minimal output, only show final result
+
+**Note**: Structural validation is fast and checks metadata, headers, and index integrity. Data verification decompresses all content and is slower but provides complete validation.
 
 ## Archive Formats
 
@@ -497,6 +567,58 @@ func main() {
 }
 ```
 
+### Verification with Progress
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "github.com/creativeyann17/go-delta/pkg/verify"
+)
+
+func main() {
+    opts := &verify.Options{
+        InputPath:  "backup.delta",
+        VerifyData: true, // Full data integrity check
+        Verbose:    false,
+    }
+
+    // Custom progress callback
+    progressCb := func(event verify.ProgressEvent) {
+        switch event.Type {
+        case verify.EventStart:
+            fmt.Printf("Starting: %s\n", event.Message)
+        case verify.EventFileVerify:
+            fmt.Printf("Checking file %d/%d: %s\n", event.Current, event.Total, event.FilePath)
+        case verify.EventChunkVerify:
+            if event.Current%100 == 0 {
+                fmt.Printf("Verified %d/%d chunks\n", event.Current, event.Total)
+            }
+        case verify.EventComplete:
+            fmt.Println("Verification complete")
+        case verify.EventError:
+            fmt.Printf("Error: %s\n", event.Message)
+        }
+    }
+
+    result, err := verify.Verify(opts, progressCb)
+    if err != nil && result == nil {
+        log.Fatal(err)
+    }
+
+    // Print formatted summary
+    fmt.Print(result.Summary())
+
+    if !result.IsValid() {
+        log.Fatalf("Archive validation failed with %d errors", len(result.Errors))
+    }
+
+    fmt.Printf("✓ Archive is valid (%.1f%% compression ratio)\n", result.CompressionRatio())
+}
+```
+
 ## API Reference
 
 ### Compression
@@ -566,15 +688,102 @@ type Result struct {
 }
 ```
 
+### Verification
+
+#### `verify.Options`
+```go
+type Options struct {
+    InputPath  string  // Archive file to verify (required)
+    VerifyData bool    // Perform full data integrity check (default: false)
+    Verbose    bool    // Detailed logging
+    Quiet      bool    // Suppress output
+}
+```
+
+#### `verify.Result`
+```go
+type Result struct {
+    // Archive metadata
+    Format      Format // GDELTA01, GDELTA02, ZIP, or UNKNOWN
+    ArchivePath string // Path to verified archive
+    ArchiveSize uint64 // Total archive size in bytes
+    
+    // Validation status
+    HeaderValid    bool // Header is valid
+    FooterValid    bool // Footer is valid
+    StructureValid bool // Overall structure is valid
+    IndexValid     bool // Chunk index is valid (GDELTA02)
+    MetadataValid  bool // File metadata is valid
+    
+    // File statistics
+    FileCount     int    // Number of files
+    TotalOrigSize uint64 // Sum of original sizes
+    TotalCompSize uint64 // Sum of compressed sizes
+    EmptyFiles    int    // Number of zero-byte files
+    
+    // GDELTA02 chunk info
+    ChunkSize     uint64 // Configured chunk size
+    ChunkCount    uint64 // Unique chunks
+    TotalChunkRef uint64 // Total chunk references
+    
+    // Data integrity (when VerifyData=true)
+    DataVerified   bool // Data verification was performed
+    FilesVerified  int  // Files with verified data
+    ChunksVerified int  // Chunks with verified data
+    CorruptFiles   int  // Files that failed verification
+    CorruptChunks  int  // Chunks that failed verification
+    
+    // Issues found
+    DuplicatePaths int     // Files with duplicate paths
+    OrphanedChunks int     // Unreferenced chunks (GDELTA02)
+    MissingChunks  int     // Missing chunk references (GDELTA02)
+    Errors         []error // All errors encountered
+    
+    // File details
+    Files []FileInfo // Per-file verification info
+}
+
+func (r *Result) IsValid() bool                     // True if archive passed all checks
+func (r *Result) Success() bool                      // Alias for IsValid()
+func (r *Result) CompressionRatio() float64          // Compression ratio as percentage
+func (r *Result) SpaceSaved() uint64                 // Bytes saved by compression
+func (r *Result) SpaceSavedRatio() float64           // Space saved as percentage
+func (r *Result) ChunkDeduplicationRatio() float64   // Deduplication ratio (GDELTA02)
+func (r *Result) AverageChunksPerFile() float64      // Average chunks per file (GDELTA02)
+func (r *Result) Summary() string                    // Human-readable summary
+```
+
+#### `verify.ProgressEvent`
+```go
+type ProgressEvent struct {
+    Type     EventType // Start, FileVerify, ChunkVerify, Complete, Error
+    FilePath string    // File being verified
+    Current  int       // Current progress
+    Total    int       // Total items
+    Message  string    // Progress message
+}
+
+// Event types
+const (
+    EventStart       EventType = iota
+    EventFileVerify
+    EventChunkVerify
+    EventComplete
+    EventError
+)
+```
+
 ### Error Handling
 
-Both compress and decompress operations return two types of errors:
+All operations return two types of errors:
 
 1. **Fatal errors** - Returned as `error` (operation cannot continue)
 2. **Non-fatal errors** - Collected in `result.Errors` (operation continues)
 
-Common non-fatal errors:
-- `decompress.ErrFileExists` - File already exists (use `--overwrite`)
+**Common errors:**
+- Compression: File read errors, permission denied
+- Decompression: `decompress.ErrFileExists` (use `--overwrite`)
+- Verification: `verify.ErrInvalidMagic`, `verify.ErrTruncatedArchive`, `verify.ErrCorruptData`
 
 ## Development
 
