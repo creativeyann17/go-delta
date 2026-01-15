@@ -69,6 +69,14 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
+	// Create a reusable zstd decoder for better performance
+	// The decoder is reset for each chunk instead of creating a new one
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return fmt.Errorf("create zstd decoder: %w", err)
+	}
+	defer decoder.Close()
+
 	// Decompress each file by reassembling its chunks
 	var totalDecompSize uint64
 
@@ -155,12 +163,11 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 				break
 			}
 
-			// Decompress chunk
-			dec, err := zstd.NewReader(bytes.NewReader(compressedData))
-			if err != nil {
+			// Decompress chunk using the reusable decoder
+			if err := decoder.Reset(bytes.NewReader(compressedData)); err != nil {
 				outFile.Close()
 				os.Remove(outputPath)
-				result.Errors = append(result.Errors, fmt.Errorf("%s: create decoder: %w", metadata.RelPath, err))
+				result.Errors = append(result.Errors, fmt.Errorf("%s: reset decoder: %w", metadata.RelPath, err))
 				if progressCb != nil {
 					progressCb(ProgressEvent{Type: EventError, FilePath: metadata.RelPath})
 				}
@@ -168,8 +175,7 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 			}
 
 			// Write decompressed chunk to output file
-			n, err := io.Copy(outFile, dec)
-			dec.Close()
+			n, err := io.Copy(outFile, decoder)
 
 			if err != nil {
 				outFile.Close()

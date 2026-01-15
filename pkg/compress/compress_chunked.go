@@ -92,10 +92,21 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 		// Setup signal handler to cleanup temp file on interruption
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		sigDone := make(chan struct{})
 		go func() {
-			<-sigChan
-			cleanupTempFile()
-			os.Exit(1)
+			select {
+			case <-sigChan:
+				cleanupTempFile()
+				os.Exit(1)
+			case <-sigDone:
+				// Normal completion, exit goroutine
+				return
+			}
+		}()
+		// Ensure we stop the signal handler when done
+		defer func() {
+			signal.Stop(sigChan)
+			close(sigDone)
 		}()
 
 		chunkDataWriter = chunkDataFile
@@ -283,24 +294,13 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 			}
 		}
 
-		// Convert chunkstore.ChunkInfo to format.ChunkInfo
-		formatChunkIndex := make(map[[32]byte]format.ChunkInfo, len(chunkIndex))
-		for hash, info := range chunkIndex {
-			formatChunkIndex[hash] = format.ChunkInfo{
-				Hash:           info.Hash,
-				Offset:         info.Offset,
-				CompressedSize: info.CompressedSize,
-				OriginalSize:   info.OriginalSize,
-			}
-		}
-
 		// Write header
 		if err := format.WriteGDelta02Header(writer, opts.ChunkSize, uint32(len(fileMetadataList)), uint32(len(chunkIndex))); err != nil {
 			return fmt.Errorf("write header: %w", err)
 		}
 
-		// Write chunk index
-		if err := format.WriteChunkIndex(writer, formatChunkIndex); err != nil {
+		// Write chunk index (chunkstore.ChunkInfo is now an alias for format.ChunkInfo)
+		if err := format.WriteChunkIndex(writer, chunkIndex); err != nil {
 			return fmt.Errorf("write chunk index: %w", err)
 		}
 

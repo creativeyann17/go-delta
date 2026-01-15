@@ -133,7 +133,7 @@ func (o *Options) Validate() error {
 	// ZIP mode uses deflate compression (1-9 levels)
 	if o.UseZipFormat {
 		if o.Level < 1 || o.Level > 9 {
-			return ErrInvalidLevel
+			return ErrInvalidLevelZip
 		}
 		if o.ChunkSize > 0 {
 			return ErrZipNoChunking
@@ -141,7 +141,19 @@ func (o *Options) Validate() error {
 	} else {
 		// GDELTA mode uses zstd (1-22 levels)
 		if o.Level < 1 || o.Level > 22 {
-			return ErrInvalidLevel
+			return ErrInvalidLevelZstd
+		}
+	}
+
+	// Validate chunk size bounds if chunking is enabled
+	if o.ChunkSize > 0 {
+		const minChunkSize = 4 * 1024         // 4KB minimum
+		const maxChunkSize = 64 * 1024 * 1024 // 64MB maximum
+		if o.ChunkSize < minChunkSize {
+			return ErrChunkSizeTooSmall
+		}
+		if o.ChunkSize > maxChunkSize {
+			return ErrChunkSizeTooLarge
 		}
 	}
 	if o.Quiet {

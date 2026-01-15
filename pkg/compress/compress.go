@@ -104,6 +104,7 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 
 	result.FilesTotal = totalFiles
 	result.OriginalSize = totalOrigSize
+	result.ChunkSize = opts.ChunkSize
 
 	// Resolve parallelism strategy
 	resolvedParallelism := resolveParallelism(opts.Parallelism, foldersToCompress, opts.MaxThreads)

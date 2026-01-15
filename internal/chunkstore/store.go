@@ -5,15 +5,12 @@ import (
 	"container/list"
 	"sync"
 	"sync/atomic"
+
+	"github.com/creativeyann17/go-delta/internal/format"
 )
 
-// ChunkInfo contains metadata about a stored chunk
-type ChunkInfo struct {
-	Hash           [32]byte
-	Offset         uint64 // Position in archive chunk data section
-	CompressedSize uint64
-	OriginalSize   uint64
-}
+// ChunkInfo is an alias for format.ChunkInfo for convenience
+type ChunkInfo = format.ChunkInfo
 
 // chunkEntry tracks chunk info with LRU metadata
 type chunkEntry struct {

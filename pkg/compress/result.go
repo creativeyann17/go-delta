@@ -15,6 +15,9 @@ type Result struct {
 	// Total compressed size in bytes
 	CompressedSize uint64
 
+	// ChunkSize is the configured chunk size (0 if chunking disabled)
+	ChunkSize uint64
+
 	// Chunk deduplication statistics (when chunking enabled)
 	TotalChunks   uint64 // Total chunks processed
 	UniqueChunks  uint64 // Unique chunks stored
