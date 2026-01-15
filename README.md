@@ -4,6 +4,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/creativeyann17/go-delta)](https://github.com/creativeyann17/go-delta/releases/latest)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/creativeyann17/go-delta)](go.mod)
 [![License](https://img.shields.io/github/license/creativeyann17/go-delta)](LICENSE)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-orange?logo=buy-me-a-coffee&logoColor=white)](https://buymeacoffee.com/creativeyann17)
 
 A smart delta compression tool for backups written in Go.
 
