@@ -30,6 +30,7 @@ func compressCmd() *cobra.Command {
 	var quiet bool
 	var compressLevel int
 	var useZipFormat bool
+	var useGitignore bool
 
 	cmd := &cobra.Command{
 		Use:   "compress",
@@ -118,6 +119,7 @@ func compressCmd() *cobra.Command {
 				DryRun:          dryRun,
 				Verbose:         verbose,
 				Quiet:           quiet,
+				UseGitignore:    useGitignore,
 			}
 
 			// Validate and set defaults
@@ -161,6 +163,9 @@ func compressCmd() *cobra.Command {
 			}
 			if dryRun {
 				log("  Mode:        DRY-RUN (no data written)")
+			}
+			if useGitignore {
+				log("  Gitignore:   enabled")
 			}
 			log("")
 
@@ -209,6 +214,8 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Minimal output (overrides verbose)")
 	cmd.Flags().IntVarP(&compressLevel, "level", "l", 5,
 		"Compression level: 1-9 for ZIP deflate, 1-22 for zstd (1=fastest, 9=best default, 19=max ratio for zstd)")
+	cmd.Flags().BoolVar(&useGitignore, "gitignore", false,
+		"Respect .gitignore files to exclude matching paths")
 
 	_ = cmd.MarkFlagRequired("input")
 

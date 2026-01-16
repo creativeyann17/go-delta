@@ -86,6 +86,9 @@ type Options struct {
 
 	// Quiet suppresses all output except errors
 	Quiet bool
+
+	// UseGitignore respects .gitignore files to exclude matching paths
+	UseGitignore bool
 }
 
 // DefaultOptions returns options with sensible defaults

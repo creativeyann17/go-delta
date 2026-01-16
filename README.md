@@ -30,6 +30,7 @@ A smart delta compression tool for backups written in Go.
 - **CLI and Library** - Use as a command-line tool or Go library
 - **Compress & Decompress** - Full round-trip support with integrity validation
 - **Overwrite protection** - Safe decompression with optional overwrite mode
+- **Gitignore support** - Respect `.gitignore` files (including nested) to exclude matching paths during compression
 
 ## Installation
 
@@ -108,6 +109,14 @@ godelta compress \
   --zip \
   --level 9 \
   --threads 8
+
+# Respect .gitignore files to exclude matching paths
+# Works with nested .gitignore files throughout the directory tree
+godelta compress \
+  --input /project \
+  --output project-backup.delta \
+  --gitignore \
+  --verbose
 ```
 
 **Note**: ZIP format with multiple threads creates one archive file per thread (e.g., `archive_01.zip`, `archive_02.zip`, etc.) for true parallel compression without mutex contention. Decompression auto-detects and extracts all parts.
@@ -195,6 +204,7 @@ Chunk Info:
 - `--chunk-size`: Average chunk size for content-defined dedup (e.g. `64KB`, `512KB`, actual chunks vary 1/4x-4x, min: `4KB`, `0=disabled`, default: 0, GDELTA only)
 - `--chunk-store-size`: Max in-memory dedup cache size (e.g. `1GB`, `500MB`, `0=unlimited`, default: 0, GDELTA only)
 - `--zip`: Create standard ZIP archive instead of GDELTA format (universally compatible, no deduplication)
+- `--gitignore`: Respect `.gitignore` files to exclude matching paths (supports nested .gitignore files)
 - `--dry-run`: Simulate without writing
 - `--verbose`: Show detailed output including chunk statistics
 - `--quiet`: Minimal output
@@ -256,6 +266,48 @@ unzip -d /restore backup_01.zip
 unzip -d /restore backup_02.zip
 # ... etc
 ```
+
+## Gitignore Support
+
+The `--gitignore` flag enables automatic exclusion of files matching patterns defined in `.gitignore` files. This feature is useful for excluding build artifacts, dependencies, logs, and other generated files from backups.
+
+**Features:**
+- **Nested `.gitignore` files**: Supports multiple `.gitignore` files throughout the directory tree
+- **Pattern inheritance**: Child directories inherit patterns from parent `.gitignore` files
+- **Git-compliant behavior**: Follows standard Git ignore semantics
+- **Efficient pre-scanning**: Scans for all `.gitignore` files once before compression
+- **Directory pruning**: Skips entire directories matching ignore patterns (e.g., `node_modules/`, `build/`)
+
+**Supported patterns:**
+- Wildcards: `*.log`, `*.tmp`
+- Directories: `build/`, `node_modules/`
+- Negation: `!important.log` (within same file)
+- Double-star: `**/temp/`, `**/*.bak`
+- Comments: `# This is a comment`
+
+**Example:**
+```bash
+# Create backup excluding files matched by .gitignore
+godelta compress \
+  --input /project \
+  --output project-backup.delta \
+  --gitignore \
+  --verbose
+```
+
+**How it works:**
+1. Scans directory tree for all `.gitignore` files before compression
+2. Compiles each `.gitignore` into pattern matchers
+3. During file traversal, checks each file against applicable patterns (root to child hierarchy)
+4. Prunes entire directories matching directory patterns (e.g., `build/`)
+5. Skips individual files matching file patterns (e.g., `*.log`)
+
+**Pattern priority:**
+- More specific (child) `.gitignore` patterns apply to files in subdirectories
+- Parent patterns apply to all descendants unless negated
+- Directory-specific patterns (with trailing `/`) only match directories
+
+**Note:** `.gitignore` files themselves are **included** in the archive by default. To exclude them, add `.gitignore` to your `.gitignore` file.
 
 ### GDELTA01 (Traditional)
 Custom format with zstandard compression (no deduplication):

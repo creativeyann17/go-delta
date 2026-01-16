@@ -526,6 +526,12 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 			}
 
 			if info.IsDir() {
+				// Create gitignore matcher for this directory if enabled
+				var matcher *gitignoreMatcher
+				if opts.UseGitignore {
+					matcher, _ = newGitignoreMatcher(cleanPath)
+				}
+
 				// Walk directory, paths are relative to this directory
 				dirBase := filepath.Base(cleanPath)
 				err := filepath.Walk(cleanPath, func(path string, finfo os.FileInfo, err error) error {
@@ -533,12 +539,28 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", path, err))
 						return nil
 					}
-					if finfo.IsDir() || !finfo.Mode().IsRegular() {
+
+					// Calculate relative path within the walked directory (for gitignore matching)
+					relToDir, _ := filepath.Rel(cleanPath, path)
+
+					// Check gitignore for directories (prune entire subtree)
+					if finfo.IsDir() {
+						if path != cleanPath && matcher != nil && matcher.ShouldIgnoreDir(relToDir) {
+							return filepath.SkipDir
+						}
+						return nil
+					}
+
+					if !finfo.Mode().IsRegular() {
+						return nil
+					}
+
+					// Check gitignore for files
+					if matcher != nil && matcher.ShouldIgnore(relToDir) {
 						return nil
 					}
 
 					// RelPath = dirBase + path relative to cleanPath
-					relToDir, _ := filepath.Rel(cleanPath, path)
 					relPath := filepath.Join(dirBase, relToDir)
 
 					if err := addFile(path, relPath, finfo, inputPath); err != nil {
@@ -560,18 +582,39 @@ func collectFiles(opts *Options, result *Result) ([]folderTask, int, uint64, err
 	} else {
 		// InputPath mode: walk and use paths relative to InputPath
 		baseDir := opts.InputPath
+
+		// Create gitignore matcher if enabled
+		var matcher *gitignoreMatcher
+		if opts.UseGitignore {
+			matcher, _ = newGitignoreMatcher(baseDir)
+		}
+
 		err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", path, err))
-				return nil
-			}
-			if info.IsDir() || !info.Mode().IsRegular() {
 				return nil
 			}
 
 			relPath, err := filepath.Rel(baseDir, path)
 			if err != nil {
 				relPath = filepath.Base(path)
+			}
+
+			// Check gitignore for directories (prune entire subtree)
+			if info.IsDir() {
+				if path != baseDir && matcher != nil && matcher.ShouldIgnoreDir(relPath) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+
+			// Check gitignore for files
+			if matcher != nil && matcher.ShouldIgnore(relPath) {
+				return nil
 			}
 
 			if err := addFile(path, relPath, info, baseDir); err != nil {
