@@ -201,7 +201,8 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	// Worker function to process a single file task
 	// Streams compressed data to temp file to avoid memory accumulation
 	processFileTask := func(task fileTask) (tempPath string, comprSize uint64, err error) {
-		if progressCb != nil {
+		// Skip progress bar for 0-byte files (no progress to show)
+		if progressCb != nil && task.OrigSize > 0 {
 			progressCb(ProgressEvent{
 				Type:     EventFileStart,
 				FilePath: task.RelPath,

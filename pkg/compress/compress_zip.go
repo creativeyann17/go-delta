@@ -100,8 +100,8 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 			}
 
 			for task := range workerCh {
-				// Notify file start
-				if progressCb != nil {
+				// Skip progress bar for 0-byte files (no progress to show)
+				if progressCb != nil && task.OrigSize > 0 {
 					progressCb(ProgressEvent{
 						Type:     EventFileStart,
 						FilePath: task.RelPath,

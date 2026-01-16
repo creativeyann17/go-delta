@@ -120,7 +120,8 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 
 	// Worker function to process a single file task
 	processFileTask := func(task fileTask, workerID int) {
-		if progressCb != nil {
+		// Skip progress bar for 0-byte files (no progress to show)
+		if progressCb != nil && task.OrigSize > 0 {
 			progressCb(ProgressEvent{
 				Type:     EventFileStart,
 				FilePath: task.RelPath,
