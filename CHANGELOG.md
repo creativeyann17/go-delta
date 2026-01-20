@@ -6,6 +6,7 @@
 - **Multi-part archive verification** - Auto-detects and verifies all parts (ZIP and XZ)
 
 ### Improved
+- Bump to go version `v1.25`
 - Refactored shared I/O utilities for better code reuse
 - Centralized format detection logic
 - Updated documentation with verification performance notes
