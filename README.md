@@ -1035,11 +1035,10 @@ make install-hooks  # Install pre-commit hook
 
 The project uses GitHub Actions for continuous integration:
 
-1. **Test** - Run all tests on push/tag
-2. **Build** - Build binaries for all platforms (only if tests pass)
-3. **Release** - Create GitHub release with binaries (only if build succeeds)
+1. **Test** - Run all tests on tag push
+2. **Release** - Build binaries and create GitHub release (only if tests pass)
 
-Workflow file: [.github/workflows/build-and-release.yml](.github/workflows/build-and-release.yml)
+Workflow file: [.github/workflows/test-and-release.yml](.github/workflows/test-and-release.yml)
 
 ## Testing
 
