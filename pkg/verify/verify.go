@@ -2,13 +2,19 @@
 package verify
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/creativeyann17/go-delta/internal/format"
+	"github.com/creativeyann17/go-delta/pkg/godelta"
 	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
 )
 
 // ProgressCallback is called for progress updates during verification
@@ -71,28 +77,30 @@ func Verify(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		return nil, fmt.Errorf("seek to start: %w", err)
 	}
 
-	// Route based on format
-	switch {
-	case string(magic) == format.ArchiveMagic:
+	// Detect and route based on format
+	detectedFormat := format.DetectFormat(magic)
+	switch detectedFormat {
+	case format.FormatGDelta01:
 		result.Format = FormatGDelta01
 		return result, verifyGDelta01(archiveFile, opts, progressCb, result)
 
-	case string(magic) == format.ArchiveMagic02:
+	case format.FormatGDelta02:
 		result.Format = FormatGDelta02
 		return result, verifyGDelta02(archiveFile, opts, progressCb, result)
 
-	case string(magic) == format.ArchiveMagic03:
+	case format.FormatGDelta03:
 		result.Format = FormatGDelta03
 		return result, verifyGDelta03(archiveFile, opts, progressCb, result)
 
-	case magic[0] == 'P' && magic[1] == 'K':
+	case format.FormatZIP:
 		result.Format = FormatZIP
-		// ZIP verification not implemented yet
-		result.HeaderValid = true
-		result.StructureValid = true
-		result.FooterValid = true
-		result.Errors = append(result.Errors, fmt.Errorf("ZIP verification not yet implemented"))
-		return result, nil
+		archiveFile.Close() // ZIP reader needs file path
+		return result, verifyZip(opts, progressCb, result)
+
+	case format.FormatXZ:
+		result.Format = FormatXZ
+		archiveFile.Close() // XZ reader needs file path
+		return result, verifyXz(opts, progressCb, result)
 
 	default:
 		result.Format = FormatUnknown
@@ -123,7 +131,7 @@ func verifyGDelta01(archiveFile *os.File, opts *Options, progressCb ProgressCall
 	}
 
 	// Track seen paths for duplicate detection
-	seenPaths := make(map[string]bool)
+	pathTracker := godelta.NewPathTracker()
 
 	// Read and verify each file entry
 	for i := 0; i < result.FileCount; i++ {
@@ -141,11 +149,10 @@ func verifyGDelta01(archiveFile *os.File, opts *Options, progressCb ProgressCall
 		}
 
 		// Check for duplicates
-		if seenPaths[entry.Path] {
+		if pathTracker.CheckDuplicate(entry.Path) {
 			result.DuplicatePaths++
 			result.Errors = append(result.Errors, fmt.Errorf("duplicate path: %s", entry.Path))
 		}
-		seenPaths[entry.Path] = true
 
 		// Track stats
 		result.TotalOrigSize += entry.OriginalSize
@@ -276,7 +283,7 @@ func verifyGDelta02(archiveFile *os.File, opts *Options, progressCb ProgressCall
 	chunkRefs := make(map[[32]byte]int)
 
 	// Track seen paths for duplicate detection
-	seenPaths := make(map[string]bool)
+	pathTracker := godelta.NewPathTracker()
 	result.MetadataValid = true
 
 	// Read file metadata
@@ -295,11 +302,10 @@ func verifyGDelta02(archiveFile *os.File, opts *Options, progressCb ProgressCall
 		}
 
 		// Check for duplicates
-		if seenPaths[metadata.RelPath] {
+		if pathTracker.CheckDuplicate(metadata.RelPath) {
 			result.DuplicatePaths++
 			result.Errors = append(result.Errors, fmt.Errorf("duplicate path: %s", metadata.RelPath))
 		}
-		seenPaths[metadata.RelPath] = true
 
 		// Track stats
 		result.TotalOrigSize += metadata.OrigSize
@@ -477,7 +483,7 @@ func verifyGDelta03(archiveFile *os.File, opts *Options, progressCb ProgressCall
 	}
 
 	// Track seen paths for duplicate detection
-	seenPaths := make(map[string]bool)
+	pathTracker := godelta.NewPathTracker()
 
 	// Header size: magic(8) + version(1) + dictSize(4) + fileCount(4) + reserved(4) = 21 bytes
 	const headerSize = 21
@@ -531,11 +537,10 @@ func verifyGDelta03(archiveFile *os.File, opts *Options, progressCb ProgressCall
 		}
 
 		// Check for duplicates
-		if seenPaths[entry.Path] {
+		if pathTracker.CheckDuplicate(entry.Path) {
 			result.DuplicatePaths++
 			result.Errors = append(result.Errors, fmt.Errorf("duplicate path: %s", entry.Path))
 		}
-		seenPaths[entry.Path] = true
 
 		// Track stats
 		result.TotalOrigSize += entry.OriginalSize
@@ -610,6 +615,299 @@ func verifyGDelta03(archiveFile *os.File, opts *Options, progressCb ProgressCall
 			Total:   result.FileCount,
 			Message: "Verification complete",
 		})
+	}
+
+	return nil
+}
+
+// verifyXz verifies a .tar.xz archive (single or multi-part)
+func verifyXz(opts *Options, progressCb ProgressCallback, result *Result) error {
+	// Detect multi-part archives
+	xzPaths := []string{opts.InputPath}
+
+	baseName := filepath.Base(opts.InputPath)
+	if strings.Contains(baseName, "_") && strings.HasSuffix(baseName, ".tar.xz") {
+		nameWithoutExt := baseName[:len(baseName)-7]
+		parts := strings.Split(nameWithoutExt, "_")
+		if len(parts) >= 2 {
+			lastPart := parts[len(parts)-1]
+			if len(lastPart) == 2 && lastPart[0] >= '0' && lastPart[0] <= '9' && lastPart[1] >= '0' && lastPart[1] <= '9' {
+				basePattern := strings.Join(parts[:len(parts)-1], "_")
+				dirPath := filepath.Dir(opts.InputPath)
+
+				xzPaths = []string{}
+				for i := 1; i <= 99; i++ {
+					partPath := filepath.Join(dirPath, fmt.Sprintf("%s_%02d.tar.xz", basePattern, i))
+					if _, err := os.Stat(partPath); err == nil {
+						xzPaths = append(xzPaths, partPath)
+					} else {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	result.HeaderValid = true
+	result.MetadataValid = true
+
+	// Track seen paths for duplicate detection
+	pathTracker := godelta.NewPathTracker()
+
+	// Verify each archive part
+	for _, xzPath := range xzPaths {
+		stat, err := os.Stat(xzPath)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("stat %s: %w", xzPath, err))
+			continue
+		}
+		result.ArchiveSize += uint64(stat.Size())
+
+		if err := verifyXzPart(xzPath, opts, progressCb, result, pathTracker); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("verify %s: %w", xzPath, err))
+		}
+	}
+
+	result.StructureValid = result.HeaderValid && result.MetadataValid && result.DuplicatePaths == 0
+	result.FooterValid = true // tar.xz doesn't have a specific footer marker
+
+	if progressCb != nil {
+		progressCb(ProgressEvent{
+			Type:    EventComplete,
+			Current: result.FileCount,
+			Total:   result.FileCount,
+			Message: "Verification complete",
+		})
+	}
+
+	return nil
+}
+
+// verifyXzPart verifies a single .tar.xz archive
+func verifyXzPart(xzPath string, opts *Options, progressCb ProgressCallback, result *Result, pathTracker *godelta.PathTracker) error {
+	file, err := os.Open(xzPath)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer file.Close()
+
+	xzReader, err := xz.NewReader(file)
+	if err != nil {
+		return fmt.Errorf("create xz reader: %w", err)
+	}
+
+	tarReader := tar.NewReader(xzReader)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("read tar header: %w", err))
+			result.MetadataValid = false
+			break
+		}
+
+		// Skip non-regular files
+		if header.Typeflag != tar.TypeReg {
+			continue
+		}
+
+		fileInfo := FileInfo{
+			Path:         header.Name,
+			OriginalSize: uint64(header.Size),
+		}
+
+		// Check for duplicates
+		if pathTracker.CheckDuplicate(header.Name) {
+			result.DuplicatePaths++
+			result.Errors = append(result.Errors, fmt.Errorf("duplicate path: %s", header.Name))
+		}
+
+		// Track stats
+		result.FileCount++
+		result.TotalOrigSize += uint64(header.Size)
+		if header.Size == 0 {
+			result.EmptyFiles++
+		}
+
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:     EventFileVerify,
+				FilePath: header.Name,
+				Current:  result.FileCount,
+				Total:    result.FileCount, // Unknown total for streaming
+			})
+		}
+
+		// Verify data if requested
+		if opts.VerifyData {
+			// Read and discard data to verify it decompresses correctly
+			written, err := io.Copy(io.Discard, tarReader)
+			if err != nil {
+				fileInfo.Error = fmt.Errorf("decompress: %w", err)
+				result.CorruptFiles++
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", header.Name, err))
+			} else if written != header.Size {
+				fileInfo.Error = fmt.Errorf("size mismatch: expected %d, got %d", header.Size, written)
+				result.CorruptFiles++
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %v", header.Name, fileInfo.Error))
+			} else {
+				fileInfo.DataValid = true
+				result.FilesVerified++
+			}
+			result.DataVerified = true
+		} else {
+			// Skip file data
+			if _, err := io.CopyN(io.Discard, tarReader, header.Size); err != nil && err != io.EOF {
+				result.Errors = append(result.Errors, fmt.Errorf("skip data for %s: %w", header.Name, err))
+			}
+		}
+
+		result.Files = append(result.Files, fileInfo)
+	}
+
+	return nil
+}
+
+// verifyZip verifies a .zip archive (single or multi-part)
+func verifyZip(opts *Options, progressCb ProgressCallback, result *Result) error {
+	// Detect multi-part archives (archive_01.zip, archive_02.zip, etc.)
+	zipPaths := []string{opts.InputPath}
+
+	baseName := filepath.Base(opts.InputPath)
+	if strings.Contains(baseName, "_") && strings.HasSuffix(baseName, ".zip") {
+		nameWithoutExt := baseName[:len(baseName)-4] // remove .zip
+		parts := strings.Split(nameWithoutExt, "_")
+		if len(parts) >= 2 {
+			lastPart := parts[len(parts)-1]
+			if len(lastPart) == 2 && lastPart[0] >= '0' && lastPart[0] <= '9' && lastPart[1] >= '0' && lastPart[1] <= '9' {
+				basePattern := strings.Join(parts[:len(parts)-1], "_")
+				dirPath := filepath.Dir(opts.InputPath)
+
+				zipPaths = []string{}
+				for i := 1; i <= 99; i++ {
+					partPath := filepath.Join(dirPath, fmt.Sprintf("%s_%02d.zip", basePattern, i))
+					if _, err := os.Stat(partPath); err == nil {
+						zipPaths = append(zipPaths, partPath)
+					} else {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	result.HeaderValid = true
+	result.MetadataValid = true
+
+	// Track seen paths for duplicate detection
+	pathTracker := godelta.NewPathTracker()
+
+	// Verify each archive part
+	for _, zipPath := range zipPaths {
+		stat, err := os.Stat(zipPath)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("stat %s: %w", zipPath, err))
+			continue
+		}
+		result.ArchiveSize += uint64(stat.Size())
+
+		if err := verifyZipPart(zipPath, opts, progressCb, result, pathTracker); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("verify %s: %w", zipPath, err))
+		}
+	}
+
+	result.StructureValid = result.HeaderValid && result.MetadataValid && result.DuplicatePaths == 0
+	result.FooterValid = true // ZIP central directory serves as footer
+
+	if progressCb != nil {
+		progressCb(ProgressEvent{
+			Type:    EventComplete,
+			Current: result.FileCount,
+			Total:   result.FileCount,
+			Message: "Verification complete",
+		})
+	}
+
+	return nil
+}
+
+// verifyZipPart verifies a single .zip archive
+func verifyZipPart(zipPath string, opts *Options, progressCb ProgressCallback, result *Result, pathTracker *godelta.PathTracker) error {
+	zipReader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		result.HeaderValid = false
+		return fmt.Errorf("open zip: %w", err)
+	}
+	defer zipReader.Close()
+
+	for _, file := range zipReader.File {
+		// Skip directories
+		if file.FileInfo().IsDir() {
+			continue
+		}
+
+		fileInfo := FileInfo{
+			Path:           file.Name,
+			OriginalSize:   file.UncompressedSize64,
+			CompressedSize: file.CompressedSize64,
+		}
+
+		// Check for duplicates
+		if pathTracker.CheckDuplicate(file.Name) {
+			result.DuplicatePaths++
+			result.Errors = append(result.Errors, fmt.Errorf("duplicate path: %s", file.Name))
+		}
+
+		// Track stats
+		result.FileCount++
+		result.TotalOrigSize += file.UncompressedSize64
+		result.TotalCompSize += file.CompressedSize64
+		if file.UncompressedSize64 == 0 {
+			result.EmptyFiles++
+		}
+
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:     EventFileVerify,
+				FilePath: file.Name,
+				Current:  result.FileCount,
+				Total:    result.FileCount, // Unknown total across all parts
+			})
+		}
+
+		// Verify data if requested
+		if opts.VerifyData {
+			rc, err := file.Open()
+			if err != nil {
+				fileInfo.Error = fmt.Errorf("open: %w", err)
+				result.CorruptFiles++
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", file.Name, err))
+				result.Files = append(result.Files, fileInfo)
+				continue
+			}
+
+			written, err := io.Copy(io.Discard, rc)
+			rc.Close()
+
+			if err != nil {
+				fileInfo.Error = fmt.Errorf("decompress: %w", err)
+				result.CorruptFiles++
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", file.Name, err))
+			} else if uint64(written) != file.UncompressedSize64 {
+				fileInfo.Error = fmt.Errorf("size mismatch: expected %d, got %d", file.UncompressedSize64, written)
+				result.CorruptFiles++
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %v", file.Name, fileInfo.Error))
+			} else {
+				fileInfo.DataValid = true
+				result.FilesVerified++
+			}
+			result.DataVerified = true
+		}
+
+		result.Files = append(result.Files, fileInfo)
 	}
 
 	return nil

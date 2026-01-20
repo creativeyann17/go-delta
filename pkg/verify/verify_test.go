@@ -664,39 +664,186 @@ func TestVerifyWithDeduplication(t *testing.T) {
 	}
 }
 
-// TestVerifyZIPFormat tests ZIP archive detection
+// TestVerifyXZFormat tests XZ archive verification
+func TestVerifyXZFormat(t *testing.T) {
+	// Create test files
+	sourceDir := t.TempDir()
+	archivePath := filepath.Join(t.TempDir(), "test.tar.xz")
+
+	files := map[string][]byte{
+		"file1.txt":        []byte("hello world xz test"),
+		"file2.txt":        []byte("more test data for xz"),
+		"subdir/file3.txt": []byte("nested content in xz archive"),
+	}
+
+	for name, content := range files {
+		path := filepath.Join(sourceDir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("Failed to create dir: %v", err)
+		}
+		if err := os.WriteFile(path, content, 0644); err != nil {
+			t.Fatalf("Failed to write file: %v", err)
+		}
+	}
+
+	// Create XZ archive
+	compOpts := &compress.Options{
+		InputPath:   sourceDir,
+		OutputPath:  archivePath,
+		Level:       1, // Fast for tests
+		UseXzFormat: true,
+		MaxThreads:  1, // Single part for simpler testing
+		Quiet:       true,
+	}
+	if _, err := compress.Compress(compOpts, nil); err != nil {
+		t.Fatalf("Compression failed: %v", err)
+	}
+
+	// Find the actual archive path (multi-part naming: test_01.tar.xz)
+	actualPath := filepath.Join(filepath.Dir(archivePath), "test_01.tar.xz")
+
+	// Verify archive
+	t.Run("StructuralValidation", func(t *testing.T) {
+		opts := &verify.Options{
+			InputPath:  actualPath,
+			VerifyData: false,
+		}
+
+		result, err := verify.Verify(opts, nil)
+		if err != nil {
+			t.Fatalf("Verification failed: %v", err)
+		}
+
+		if result.Format != verify.FormatXZ {
+			t.Errorf("Expected format XZ, got %s", result.Format)
+		}
+		if !result.HeaderValid {
+			t.Error("Header should be valid")
+		}
+		if !result.StructureValid {
+			t.Error("Structure should be valid")
+		}
+		if result.FileCount != 3 {
+			t.Errorf("Expected 3 files, got %d", result.FileCount)
+		}
+		if !result.IsValid() {
+			t.Errorf("Archive should be valid, errors: %v", result.Errors)
+		}
+	})
+
+	// Verify with data check
+	t.Run("DataValidation", func(t *testing.T) {
+		opts := &verify.Options{
+			InputPath:  actualPath,
+			VerifyData: true,
+		}
+
+		result, err := verify.Verify(opts, nil)
+		if err != nil {
+			t.Fatalf("Verification failed: %v", err)
+		}
+
+		if !result.DataVerified {
+			t.Error("DataVerified should be true")
+		}
+		if result.FilesVerified != 3 {
+			t.Errorf("Expected 3 files verified, got %d", result.FilesVerified)
+		}
+		if result.CorruptFiles != 0 {
+			t.Errorf("Expected 0 corrupt files, got %d", result.CorruptFiles)
+		}
+	})
+}
+
+// TestVerifyZIPFormat tests ZIP archive verification
 func TestVerifyZIPFormat(t *testing.T) {
+	// Create test files
+	sourceDir := t.TempDir()
 	archivePath := filepath.Join(t.TempDir(), "test.zip")
 
-	// Create minimal ZIP header (PK magic bytes) with enough data
-	// to not be detected as truncated
-	zipData := []byte{0x50, 0x4B, 0x03, 0x04}       // ZIP magic
-	zipData = append(zipData, make([]byte, 100)...) // Add padding
-	if err := os.WriteFile(archivePath, zipData, 0644); err != nil {
-		t.Fatal(err)
+	files := map[string][]byte{
+		"file1.txt":        []byte("hello world zip test"),
+		"file2.txt":        []byte("more test data for zip"),
+		"subdir/file3.txt": []byte("nested content in zip archive"),
 	}
 
-	opts := &verify.Options{
-		InputPath: archivePath,
+	for name, content := range files {
+		path := filepath.Join(sourceDir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("Failed to create dir: %v", err)
+		}
+		if err := os.WriteFile(path, content, 0644); err != nil {
+			t.Fatalf("Failed to write file: %v", err)
+		}
 	}
 
-	result, err := verify.Verify(opts, nil)
-	if err != nil {
-		t.Logf("Verify returned: %v", err)
+	// Create ZIP archive
+	compOpts := &compress.Options{
+		InputPath:    sourceDir,
+		OutputPath:   archivePath,
+		Level:        1, // Fast for tests
+		UseZipFormat: true,
+		MaxThreads:   1, // Single part for simpler testing
+		Quiet:        true,
+	}
+	if _, err := compress.Compress(compOpts, nil); err != nil {
+		t.Fatalf("Compression failed: %v", err)
 	}
 
-	if result == nil {
-		t.Fatal("Expected result to be returned")
-	}
+	// Find the actual archive path (multi-part naming: test_01.zip)
+	actualPath := filepath.Join(filepath.Dir(archivePath), "test_01.zip")
 
-	if result.Format != verify.FormatZIP {
-		t.Errorf("Expected ZIP format, got %s", result.Format)
-	}
+	// Verify archive
+	t.Run("StructuralValidation", func(t *testing.T) {
+		opts := &verify.Options{
+			InputPath:  actualPath,
+			VerifyData: false,
+		}
 
-	// ZIP verification not implemented yet
-	if len(result.Errors) == 0 {
-		t.Error("Expected error for unimplemented ZIP verification")
-	}
+		result, err := verify.Verify(opts, nil)
+		if err != nil {
+			t.Fatalf("Verification failed: %v", err)
+		}
+
+		if result.Format != verify.FormatZIP {
+			t.Errorf("Expected format ZIP, got %s", result.Format)
+		}
+		if !result.HeaderValid {
+			t.Error("Header should be valid")
+		}
+		if !result.StructureValid {
+			t.Error("Structure should be valid")
+		}
+		if result.FileCount != 3 {
+			t.Errorf("Expected 3 files, got %d", result.FileCount)
+		}
+		if !result.IsValid() {
+			t.Errorf("Archive should be valid, errors: %v", result.Errors)
+		}
+	})
+
+	// Verify with data check
+	t.Run("DataValidation", func(t *testing.T) {
+		opts := &verify.Options{
+			InputPath:  actualPath,
+			VerifyData: true,
+		}
+
+		result, err := verify.Verify(opts, nil)
+		if err != nil {
+			t.Fatalf("Verification failed: %v", err)
+		}
+
+		if !result.DataVerified {
+			t.Error("DataVerified should be true")
+		}
+		if result.FilesVerified != 3 {
+			t.Errorf("Expected 3 files verified, got %d", result.FilesVerified)
+		}
+		if result.CorruptFiles != 0 {
+			t.Errorf("Expected 0 corrupt files, got %d", result.CorruptFiles)
+		}
+	})
 }
 
 // Helper function

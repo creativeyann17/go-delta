@@ -30,6 +30,7 @@ func compressCmd() *cobra.Command {
 	var quiet bool
 	var compressLevel int
 	var useZipFormat bool
+	var useXzFormat bool
 	var useDictionary bool
 	var useGitignore bool
 	var disableGC bool
@@ -42,7 +43,14 @@ func compressCmd() *cobra.Command {
 			if outputPath == "" {
 				outputPath = "archive"
 			}
-			if useZipFormat {
+			if useXzFormat {
+				// For XZ, remove .tar.xz or .xz if present - compress_xz will add _01.tar.xz, etc.
+				if strings.HasSuffix(outputPath, ".tar.xz") {
+					outputPath = outputPath[:len(outputPath)-7]
+				} else if strings.HasSuffix(outputPath, ".xz") {
+					outputPath = outputPath[:len(outputPath)-3]
+				}
+			} else if useZipFormat {
 				// For ZIP, remove .zip if present - compress_zip will add _01.zip, _02.zip, etc.
 				if strings.HasSuffix(outputPath, ".zip") {
 					outputPath = outputPath[:len(outputPath)-4]
@@ -118,6 +126,7 @@ func compressCmd() *cobra.Command {
 				ChunkStoreSize:  chunkStoreSizeKB / 1024, // Convert KB to MB (ChunkStoreSize is in MB)
 				Level:           compressLevel,
 				UseZipFormat:    useZipFormat,
+				UseXzFormat:     useXzFormat,
 				UseDictionary:   useDictionary,
 				DryRun:          dryRun,
 				Verbose:         verbose,
@@ -137,7 +146,9 @@ func compressCmd() *cobra.Command {
 			}
 
 			formatType := "GDELTA01"
-			if useZipFormat {
+			if useXzFormat {
+				formatType = "XZ"
+			} else if useZipFormat {
 				formatType = "ZIP"
 			} else if useDictionary {
 				formatType = "GDELTA03"
@@ -218,6 +229,7 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Average chunk size for content-defined dedup (e.g. 64KB, 512KB, actual chunks vary 1/4x to 4x, 0=disabled)")
 	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=auto ~25% RAM, does NOT limit archive size)")
 	cmd.Flags().BoolVar(&useZipFormat, "zip", false, "Create standard ZIP archive instead of GDELTA format (universally compatible)")
+	cmd.Flags().BoolVar(&useXzFormat, "xz", false, "Create standard .tar.xz archive (best compression ratio, slower than zstd)")
 	cmd.Flags().BoolVar(&useDictionary, "dictionary", false, "Use dictionary compression (GDELTA03 format, good for many small files with common patterns)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Simulate without writing anything")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")

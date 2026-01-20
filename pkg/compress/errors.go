@@ -22,6 +22,18 @@ var (
 	// ErrZipNoDictionary is returned when trying to use dictionary with ZIP format
 	ErrZipNoDictionary = errors.New("dictionary compression is not supported in ZIP format")
 
+	// ErrXzNoChunking is returned when trying to use chunking with XZ format
+	ErrXzNoChunking = errors.New("chunk-based deduplication is not supported in XZ format")
+
+	// ErrXzNoDictionary is returned when trying to use dictionary with XZ format
+	ErrXzNoDictionary = errors.New("dictionary compression is not supported in XZ format")
+
+	// ErrXzNoZip is returned when trying to use both XZ and ZIP formats
+	ErrXzNoZip = errors.New("cannot use both XZ and ZIP formats")
+
+	// ErrInvalidLevelXz is returned when XZ compression level is out of range
+	ErrInvalidLevelXz = errors.New("compression level for XZ (LZMA2) must be between 1 and 9")
+
 	// ErrDictionaryNoChunking is returned when trying to use both dictionary and chunking
 	ErrDictionaryNoChunking = errors.New("dictionary compression cannot be combined with chunking")
 

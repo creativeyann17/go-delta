@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/creativeyann17/go-delta/internal/format"
+	"github.com/creativeyann17/go-delta/pkg/godelta"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -121,6 +122,11 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	// Route to ZIP compression if UseZipFormat is enabled
 	if opts.UseZipFormat {
 		return result, compressToZip(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result, resolvedParallelism)
+	}
+
+	// Route to XZ compression if UseXzFormat is enabled
+	if opts.UseXzFormat {
+		return result, compressToXz(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result, resolvedParallelism)
 	}
 
 	// Route to dictionary compression if UseDictionary is enabled
@@ -411,9 +417,9 @@ func compressFileToWriter(
 
 	// Track compressed bytes
 	var compressedBytes uint64
-	targetWriter := &progressWriter{
+	targetWriter := &godelta.ProgressWriter{
 		Writer: writer,
-		onWrite: func(n int) {
+		OnWrite: func(n int) {
 			compressedBytes += uint64(n)
 		},
 	}
@@ -429,9 +435,9 @@ func compressFileToWriter(
 
 	// Progress tracking reader
 	uncompressedRead := uint64(0)
-	proxy := &progressReader{
+	proxy := &godelta.ProgressReader{
 		Reader: src,
-		onRead: func(n int) {
+		OnRead: func(n int) {
 			uncompressedRead += uint64(n)
 			if progressCb != nil {
 				progressCb(ProgressEvent{
@@ -458,32 +464,6 @@ func compressFileToWriter(
 	}
 
 	return compressedBytes, nil
-}
-
-type progressWriter struct {
-	io.Writer
-	onWrite func(int)
-}
-
-func (pw *progressWriter) Write(p []byte) (n int, err error) {
-	n, err = pw.Writer.Write(p)
-	if n > 0 && pw.onWrite != nil {
-		pw.onWrite(n)
-	}
-	return n, err
-}
-
-type progressReader struct {
-	io.Reader
-	onRead func(int)
-}
-
-func (pr *progressReader) Read(p []byte) (n int, err error) {
-	n, err = pr.Reader.Read(p)
-	if n > 0 && pr.onRead != nil {
-		pr.onRead(n)
-	}
-	return n, err
 }
 
 // collectFiles gathers all files from either the Files list or InputPath

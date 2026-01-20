@@ -1,7 +1,11 @@
 // pkg/verify/result.go
 package verify
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/creativeyann17/go-delta/pkg/godelta"
+)
 
 // Format represents the archive format type
 type Format string
@@ -11,6 +15,7 @@ const (
 	FormatGDelta02 Format = "GDELTA02"
 	FormatGDelta03 Format = "GDELTA03"
 	FormatZIP      Format = "ZIP"
+	FormatXZ       Format = "XZ"
 	FormatUnknown  Format = "UNKNOWN"
 )
 
@@ -137,20 +142,20 @@ func (r *Result) Summary() string {
 
 	s := fmt.Sprintf("Archive: %s [%s]\n", r.ArchivePath, status)
 	s += fmt.Sprintf("Format:  %s\n", r.Format)
-	s += fmt.Sprintf("Size:    %s\n", formatSize(r.ArchiveSize))
+	s += fmt.Sprintf("Size:    %s\n", godelta.FormatSize(r.ArchiveSize))
 	s += fmt.Sprintf("Files:   %d\n", r.FileCount)
 
 	if r.TotalOrigSize > 0 {
-		s += fmt.Sprintf("Original:   %s\n", formatSize(r.TotalOrigSize))
+		s += fmt.Sprintf("Original:   %s\n", godelta.FormatSize(r.TotalOrigSize))
 		s += fmt.Sprintf("Compressed: %s (%.1f%% ratio)\n",
-			formatSize(r.TotalCompSize), r.CompressionRatio())
+			godelta.FormatSize(r.TotalCompSize), r.CompressionRatio())
 		s += fmt.Sprintf("Saved:      %s (%.1f%%)\n",
-			formatSize(r.SpaceSaved()), r.SpaceSavedRatio())
+			godelta.FormatSize(r.SpaceSaved()), r.SpaceSavedRatio())
 	}
 
 	if r.Format == FormatGDelta02 {
 		s += fmt.Sprintf("\nChunk Info:\n")
-		s += fmt.Sprintf("  Chunk Size:  %s\n", formatSize(r.ChunkSize))
+		s += fmt.Sprintf("  Chunk Size:  %s\n", godelta.FormatSize(r.ChunkSize))
 		s += fmt.Sprintf("  Unique:      %d chunks\n", r.ChunkCount)
 		s += fmt.Sprintf("  References:  %d total\n", r.TotalChunkRef)
 		if r.ChunkDeduplicationRatio() > 0 {
@@ -160,7 +165,7 @@ func (r *Result) Summary() string {
 
 	if r.Format == FormatGDelta03 {
 		s += fmt.Sprintf("\nDictionary Info:\n")
-		s += fmt.Sprintf("  Dict Size:  %s\n", formatSize(uint64(r.DictSize)))
+		s += fmt.Sprintf("  Dict Size:  %s\n", godelta.FormatSize(uint64(r.DictSize)))
 	}
 
 	if r.DataVerified {
@@ -189,18 +194,4 @@ func (r *Result) Summary() string {
 	}
 
 	return s
-}
-
-// formatSize formats bytes to human-readable string
-func formatSize(bytes uint64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := uint64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/creativeyann17/go-delta/internal/format"
+	"github.com/creativeyann17/go-delta/pkg/godelta"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -63,26 +64,26 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		return nil, fmt.Errorf("seek to start: %w", err)
 	}
 
-	// Check if it's a ZIP file (PK signature - can be \x03\x04 for local file header or \x05\x06 for empty ZIP)
-	if magic[0] == 'P' && magic[1] == 'K' {
+	// Detect and route based on format
+	detectedFormat := format.DetectFormat(magic)
+	switch detectedFormat {
+	case format.FormatZIP:
 		archiveFile.Close() // ZIP reader needs file path, not handle
 		return result, decompressZip(opts, progressCb, result)
-	}
 
-	// Route based on GDELTA format version
-	switch string(magic) {
-	case format.ArchiveMagic03:
-		// GDELTA03 with dictionary compression
+	case format.FormatXZ:
+		archiveFile.Close() // XZ reader needs file path, not handle
+		return result, decompressXz(opts, progressCb, result)
+
+	case format.FormatGDelta03:
 		err := decompressGDelta03(archiveFile, opts, progressCb, result)
 		return result, err
 
-	case format.ArchiveMagic02:
-		// GDELTA02 with chunking
+	case format.FormatGDelta02:
 		err := decompressGDelta02(archiveFile, opts, progressCb, result)
 		return result, err
 
-	case format.ArchiveMagic:
-		// GDELTA01 traditional format
+	case format.FormatGDelta01:
 		err := decompressGDelta01(archiveFile, opts, progressCb, result)
 		return result, err
 
@@ -227,9 +228,9 @@ func decompressFileFromCurrentPosition(
 
 	// Progress tracking writer
 	written := uint64(0)
-	proxy := &progressWriter{
+	proxy := &godelta.ProgressWriter{
 		Writer: outFile,
-		onWrite: func(n int) {
+		OnWrite: func(n int) {
 			written += uint64(n)
 			if progressCb != nil {
 				progressCb(ProgressEvent{
@@ -250,17 +251,4 @@ func decompressFileFromCurrentPosition(
 	}
 
 	return written, nil
-}
-
-type progressWriter struct {
-	io.Writer
-	onWrite func(int)
-}
-
-func (pw *progressWriter) Write(p []byte) (n int, err error) {
-	n, err = pw.Writer.Write(p)
-	if n > 0 && pw.onWrite != nil {
-		pw.onWrite(n)
-	}
-	return n, err
 }

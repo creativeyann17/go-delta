@@ -10,7 +10,7 @@ A smart delta compression tool for backups written in Go.
 
 ## Features
 
-- **Multiple compression formats** - GDELTA (custom format with optional deduplication) or standard ZIP (universal compatibility)
+- **Multiple compression formats** - GDELTA (custom format with optional deduplication), standard ZIP (universal compatibility), or XZ (best compression ratio)
 - **Dictionary compression** - Auto-trained zstd dictionary for better compression of many small files with common patterns (GDELTA03 format)
 - **Content-based deduplication** - FastCDC content-defined chunking with BLAKE3 hashing (GDELTA02 format)
 - **Streaming chunking** - Process large files (GB+) with constant memory usage via callback-based chunking
@@ -28,7 +28,7 @@ A smart delta compression tool for backups written in Go.
 - **Subdirectory support** - Recursively compress directory structures
 - **Custom file selection** - Library API supports custom file/folder lists (independent of directory structure)
 - **Progress visualization** - Multi-bar progress tracking for concurrent operations
-- **Archive verification** - Structural and data integrity validation for GDELTA01, GDELTA02, GDELTA03, and ZIP formats
+- **Archive verification** - Structural and data integrity validation for GDELTA01, GDELTA02, GDELTA03, ZIP, and XZ formats
 - **CLI and Library** - Use as a command-line tool or Go library
 - **Compress & Decompress** - Full round-trip support with integrity validation
 - **Overwrite protection** - Safe decompression with optional overwrite mode
@@ -136,6 +136,16 @@ godelta compress \
   --zip \
   --no-gc \
   --threads 8
+
+# XZ compression for best compression ratio (LZMA2 algorithm)
+# Multi-threaded XZ creates multiple archive files for true parallelism
+# Example: --threads 4 creates archive_01.tar.xz through archive_04.tar.xz
+godelta compress \
+  --input /data \
+  --output backup.tar.xz \
+  --xz \
+  --level 9 \
+  --threads 4
 ```
 
 **Note**: ZIP format with multiple threads creates one archive file per thread (e.g., `archive_01.zip`, `archive_02.zip`, etc.) for true parallel compression without mutex contention. Decompression auto-detects and extracts all parts.
@@ -155,7 +165,7 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 
 ### Verify archives
 
-Verify archive integrity without extracting files. Supports GDELTA01, GDELTA02, GDELTA03, and ZIP formats.
+Verify archive integrity without extracting files. Supports GDELTA01, GDELTA02, GDELTA03, ZIP, and XZ formats.
 
 ```bash
 # Quick structural validation (fast)
@@ -186,6 +196,16 @@ godelta verify -i backup.delta --quiet
   - Size verification (decompressed vs expected)
   - Chunk decompression (GDELTA02)
   - Reports corrupt files/chunks
+
+**Multi-part archive support:**
+- ZIP: Auto-detects `archive_01.zip`, `archive_02.zip`, etc.
+- XZ: Auto-detects `archive_01.tar.xz`, `archive_02.tar.xz`, etc.
+- Verifies all parts when given the first part (e.g., `godelta verify -i backup_01.zip`)
+
+**Performance notes:**
+- **ZIP verification is fast**: ZIP has a central directory, so metadata can be read without decompression
+- **XZ verification is slower**: tar.xz is a streaming format requiring full decompression to read file metadata
+- Use ZIP format when fast verification is important
 
 **Exit codes:**
 - `0` - Archive is valid
@@ -223,6 +243,7 @@ Chunk Info:
 - `--chunk-size`: Average chunk size for content-defined dedup (e.g. `64KB`, `512KB`, actual chunks vary 1/4x-4x, min: `4KB`, `0=disabled`, default: 0, GDELTA only)
 - `--chunk-store-size`: Max in-memory dedup cache size (e.g. `1GB`, `500MB`, `0=unlimited`, default: 0, GDELTA only)
 - `--zip`: Create standard ZIP archive instead of GDELTA format (universally compatible, no deduplication)
+- `--xz`: Create XZ archive with LZMA2 compression (best compression ratio, slower)
 - `--dictionary`: Use dictionary compression (GDELTA03 format, auto-trains from input, best for many small files with common patterns)
 - `--no-gc`: Disable garbage collection during ZIP compression (reduces latency spikes, uses pooled buffers)
 - `--gitignore`: Respect `.gitignore` files to exclude matching paths (supports nested .gitignore files)
@@ -245,7 +266,7 @@ Chunk Info:
 - `--verbose`: Show detailed output
 - `--quiet`: Minimal output
 
-**Note**: Decompression automatically detects the archive format (GDELTA01, GDELTA02, or ZIP) by reading the file signature.
+**Note**: Decompression automatically detects the archive format (GDELTA01, GDELTA02, GDELTA03, ZIP, or XZ) by reading the file signature.
 
 ### Verify Options
 
@@ -287,6 +308,54 @@ unzip -d /restore backup_01.zip
 unzip -d /restore backup_02.zip
 # ... etc
 ```
+
+### XZ (Best Compression)
+Standard tar.xz archive format with LZMA2 compression:
+- **Best compression ratio**: LZMA2 typically achieves 10-30% better compression than zstd or deflate
+- **Universal compatibility**: Works with standard tar and xz tools
+- **Multi-part parallel compression**: Each worker thread creates its own .tar.xz file for true parallelism
+- **No deduplication**: Each file compressed independently
+- **Use case**: Maximum compression for archival, cold storage, distribution
+
+**Multi-threaded behavior**: When using multiple threads (e.g., `--threads 4`), godelta creates one tar.xz file per thread:
+- Single thread: `backup_01.tar.xz`
+- Multi-threaded: `backup_01.tar.xz`, `backup_02.tar.xz`, ..., `backup_04.tar.xz`
+- Files are distributed evenly across worker archives
+- True parallel writes (no serialization bottleneck)
+- Decompression auto-detects and extracts all parts
+
+**Performance**: Slowest compression but best ratio. Use for archival where compression time is less critical than final size.
+
+**Compression levels**: XZ uses LZMA2 with levels 1-9:
+| Level | Speed | Compression | Memory |
+|-------|-------|-------------|--------|
+| 1     | Fast  | Good        | Low    |
+| 5     | Medium| Very Good   | Medium |
+| 9     | Slow  | Best        | High   |
+
+```bash
+# Create XZ archive (creates backup_01.tar.xz through backup_04.tar.xz with 4 threads)
+godelta compress -i /data -o backup.tar.xz --xz --level 9 --threads 4
+
+# Extract with godelta (auto-detects all parts)
+godelta decompress -i backup_01.tar.xz -o /restore
+
+# Or extract individual parts with standard tools
+tar -xJf backup_01.tar.xz -C /restore
+tar -xJf backup_02.tar.xz -C /restore
+# ... etc
+```
+
+**When to use XZ:**
+- Archival storage where size matters more than speed
+- Distributing compressed files over slow networks
+- Cold storage backups accessed infrequently
+- Text-heavy data (source code, logs, configs) where LZMA excels
+
+**When NOT to use XZ:**
+- Frequent backups where compression speed matters
+- Already compressed data (images, videos, archives)
+- Real-time or streaming applications
 
 ### ZIP Performance Tuning
 
@@ -480,12 +549,13 @@ Content-defined chunking (FastCDC):
 - **NOT recommended for**: Collections of unique compressed files, media libraries, encrypted archives
 
 **Format selection:**
+- With `--xz`: XZ format (LZMA2 compression, best ratio, slowest)
 - With `--zip`: ZIP format (deflate compression, universal compatibility)
 - With `--dictionary`: GDELTA03 (zstd + auto-trained dictionary)
 - With `--chunk-size N`: GDELTA02 (zstd + deduplication)
 - Default (no flags): GDELTA01 (zstd compression, fastest)
 
-**Note**: `--zip`, `--dictionary`, and `--chunk-size` are mutually exclusive.
+**Note**: `--xz`, `--zip`, `--dictionary`, and `--chunk-size` are mutually exclusive.
 
 ## Architecture
 
@@ -774,6 +844,7 @@ type Options struct {
     ChunkSize       uint64   // Chunk size in bytes for dedup (0=disabled, min 4096, GDELTA only)
     ChunkStoreSize  uint64   // Max chunk store size in MB (0=unlimited, GDELTA only)
     UseZipFormat    bool     // Create ZIP archive instead of GDELTA (no deduplication)
+    UseXzFormat     bool     // Create XZ archive with LZMA2 (best compression ratio)
     UseDictionary   bool     // Use dictionary compression (GDELTA03 format)
     DisableGC       bool     // Disable GC during ZIP compression (reduces latency)
     UseGitignore    bool     // Respect .gitignore files
@@ -845,7 +916,7 @@ type Options struct {
 ```go
 type Result struct {
     // Archive metadata
-    Format      Format // GDELTA01, GDELTA02, GDELTA03, ZIP, or UNKNOWN
+    Format      Format // GDELTA01, GDELTA02, GDELTA03, ZIP, XZ, or UNKNOWN
     ArchivePath string // Path to verified archive
     ArchiveSize uint64 // Total archive size in bytes
     
@@ -946,6 +1017,8 @@ make fmt            # Format code with go fmt
 The test suite includes:
 - Round-trip compression/decompression with MD5 validation
 - ZIP format with multi-part archive creation and extraction
+- XZ format compression and decompression
+- Archive verification (structural and data integrity) for all formats
 - Subdirectory handling
 - Empty file and directory edge cases
 - Overwrite protection
@@ -970,13 +1043,15 @@ Workflow file: [.github/workflows/build-and-release.yml](.github/workflows/build
 
 ## Testing
 
-Comprehensive test suite with 35+ tests covering:
+Comprehensive test suite with 40+ tests covering:
 - **FastCDC content-defined chunking** with BLAKE3 hashing
 - **Content-shift resilience** - verifies chunks match after insertions/deletions
 - **Chunked vs non-chunked comparison** - asserts dedup produces smaller archives
 - Thread-safe deduplication with bounded LRU store
 - LRU eviction under capacity pressure
 - Round-trip compression/decompression with integrity checks
+- **Archive verification** for all formats (GDELTA01, GDELTA02, GDELTA03, ZIP, XZ)
+- **Multi-part archive** creation and verification
 - Cross-directory deduplication
 - Concurrent operations
 - Error handling and edge cases

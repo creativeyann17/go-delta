@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/creativeyann17/go-delta/internal/format"
+	"github.com/creativeyann17/go-delta/pkg/godelta"
 	"github.com/klauspost/compress/dict"
 	"github.com/klauspost/compress/zstd"
 )
@@ -542,9 +543,9 @@ func compressFileWithDict(
 
 	// Track compressed bytes
 	var compressedBytes uint64
-	targetWriter := &progressWriter{
+	targetWriter := &godelta.ProgressWriter{
 		Writer: writer,
-		onWrite: func(n int) {
+		OnWrite: func(n int) {
 			compressedBytes += uint64(n)
 		},
 	}
@@ -568,9 +569,9 @@ func compressFileWithDict(
 
 	// Progress tracking
 	uncompressedRead := uint64(0)
-	proxy := &progressReader{
+	proxy := &godelta.ProgressReader{
 		Reader: src,
-		onRead: func(n int) {
+		OnRead: func(n int) {
 			uncompressedRead += uint64(n)
 			if progressCb != nil {
 				progressCb(ProgressEvent{
@@ -617,7 +618,7 @@ func dryRunDictCompression(
 		}
 
 		// Compress to discard to measure size
-		comprSize, err := compressFileWithDict(task, &countingWriter{}, dictionary, opts.Level, progressCb)
+		comprSize, err := compressFileWithDict(task, &godelta.DiscardCounter{}, dictionary, opts.Level, progressCb)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
 			if progressCb != nil {
@@ -653,14 +654,4 @@ func dryRunDictCompression(
 	}
 
 	return nil
-}
-
-// countingWriter counts bytes written but discards data
-type countingWriter struct {
-	count uint64
-}
-
-func (w *countingWriter) Write(p []byte) (int, error) {
-	w.count += uint64(len(p))
-	return len(p), nil
 }

@@ -74,6 +74,12 @@ type Options struct {
 	// Default: false
 	UseZipFormat bool
 
+	// UseXzFormat creates standard .tar.xz archives instead of GDELTA format
+	// Uses LZMA2 compression (best compression ratio, slower than zstd)
+	// Cannot be combined with ChunkSize or UseDictionary
+	// Default: false
+	UseXzFormat bool
+
 	// UseDictionary enables GDELTA03 dictionary-based compression
 	// Trains a zstd dictionary from input files for better compression
 	// Especially effective for many small files with common patterns
@@ -146,8 +152,22 @@ func (o *Options) Validate() error {
 		o.Level = 5
 	}
 
-	// ZIP mode uses deflate compression (1-9 levels)
-	if o.UseZipFormat {
+	// XZ mode uses LZMA2 compression (1-9 levels)
+	if o.UseXzFormat {
+		if o.UseZipFormat {
+			return ErrXzNoZip
+		}
+		if o.Level < 1 || o.Level > 9 {
+			return ErrInvalidLevelXz
+		}
+		if o.ChunkSize > 0 {
+			return ErrXzNoChunking
+		}
+		if o.UseDictionary {
+			return ErrXzNoDictionary
+		}
+	} else if o.UseZipFormat {
+		// ZIP mode uses deflate compression (1-9 levels)
 		if o.Level < 1 || o.Level > 9 {
 			return ErrInvalidLevelZip
 		}
