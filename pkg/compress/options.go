@@ -96,6 +96,12 @@ type Options struct {
 
 	// UseGitignore respects .gitignore files to exclude matching paths
 	UseGitignore bool
+
+	// DisableGC disables garbage collection during compression for maximum
+	// throughput. Uses pooled buffers to minimize allocations. GC is re-enabled
+	// after compression completes. Only affects ZIP compression mode.
+	// Default: false
+	DisableGC bool
 }
 
 // DefaultOptions returns options with sensible defaults

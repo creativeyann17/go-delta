@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,14 @@ import (
 // compressToZip compresses files into multiple ZIP archives (one per thread) for true parallelism
 // Output: archive_01.zip, archive_02.zip, ..., archive_N.zip
 func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result, parallelism Parallelism) error {
+	// GC control: disable GC during compression if requested
+	if opts.DisableGC {
+		// Force GC before disabling to start with a clean heap
+		runtime.GC()
+		oldGCPercent := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(oldGCPercent)
+	}
+
 	// Prepare output path base (remove .zip extension if present)
 	baseOutputPath := opts.OutputPath
 	if strings.HasSuffix(baseOutputPath, ".zip") {
@@ -147,7 +157,16 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 					}
 
 					// Write data with progress reporting (compression happens here)
-					buf := make([]byte, 32*1024) // 32KB buffer
+					// Use pooled buffer when DisableGC is enabled
+					var buf []byte
+					var returnBuf func()
+					if opts.DisableGC {
+						buf = getReadBuffer()
+						returnBuf = func() { putReadBuffer(buf) }
+					} else {
+						buf = make([]byte, 32*1024) // 32KB buffer
+						returnBuf = func() {}
+					}
 					var written int64
 					for {
 						nr, errRead := file.Read(buf)
@@ -183,6 +202,7 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 							break
 						}
 					}
+					returnBuf()
 				} else if opts.DryRun {
 					// Dry-run: estimate compression (assume 50% compression ratio for deflate)
 					totalCompSize.Add(task.OrigSize / 2)

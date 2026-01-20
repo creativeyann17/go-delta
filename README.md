@@ -11,6 +11,7 @@ A smart delta compression tool for backups written in Go.
 ## Features
 
 - **Multiple compression formats** - GDELTA (custom format with optional deduplication) or standard ZIP (universal compatibility)
+- **Dictionary compression** - Auto-trained zstd dictionary for better compression of many small files with common patterns (GDELTA03 format)
 - **Content-based deduplication** - FastCDC content-defined chunking with BLAKE3 hashing (GDELTA02 format)
 - **Streaming chunking** - Process large files (GB+) with constant memory usage via callback-based chunking
 - **Human-readable sizes** - Use `64KB`, `128MB`, `2GB` instead of raw byte counts
@@ -19,6 +20,7 @@ A smart delta compression tool for backups written in Go.
 - **Minimum chunk size enforcement** - 4KB minimum prevents metadata overhead from exceeding savings
 - **Zstandard compression** - Industry-leading compression with configurable levels (1-22) for GDELTA
 - **Deflate compression** - Standard ZIP deflate compression (levels 1-9) for universal compatibility
+- **GC-free ZIP mode** - Optional garbage collection bypass with pooled buffers for reduced latency spikes
 - **True parallel compression** - Folder-based worker pool with independent compression (no mutex contention)
 - **Streaming architecture** - Temporary file streaming avoids loading compressed data into RAM
 - **Robust cleanup** - Automatic temp file deletion on normal exit, errors, and interruptions (Ctrl+C)
@@ -26,7 +28,7 @@ A smart delta compression tool for backups written in Go.
 - **Subdirectory support** - Recursively compress directory structures
 - **Custom file selection** - Library API supports custom file/folder lists (independent of directory structure)
 - **Progress visualization** - Multi-bar progress tracking for concurrent operations
-- **Archive verification** - Structural and data integrity validation for GDELTA01, GDELTA02, and ZIP formats
+- **Archive verification** - Structural and data integrity validation for GDELTA01, GDELTA02, GDELTA03, and ZIP formats
 - **CLI and Library** - Use as a command-line tool or Go library
 - **Compress & Decompress** - Full round-trip support with integrity validation
 - **Overwrite protection** - Safe decompression with optional overwrite mode
@@ -117,6 +119,23 @@ godelta compress \
   --output project-backup.delta \
   --gitignore \
   --verbose
+
+# Dictionary compression for many small files with common patterns
+# Auto-trains a zstd dictionary from input files (GDELTA03 format)
+godelta compress \
+  --input /configs \
+  --output configs.delta \
+  --dictionary \
+  --verbose
+
+# ZIP compression with GC disabled for reduced latency spikes
+# Uses pooled buffers to minimize allocations during compression
+godelta compress \
+  --input /data \
+  --output backup.zip \
+  --zip \
+  --no-gc \
+  --threads 8
 ```
 
 **Note**: ZIP format with multiple threads creates one archive file per thread (e.g., `archive_01.zip`, `archive_02.zip`, etc.) for true parallel compression without mutex contention. Decompression auto-detects and extracts all parts.
@@ -136,7 +155,7 @@ godelta decompress -i backup.delta -o /restore/path --verbose
 
 ### Verify archives
 
-Verify archive integrity without extracting files. Supports GDELTA01, GDELTA02, and ZIP formats.
+Verify archive integrity without extracting files. Supports GDELTA01, GDELTA02, GDELTA03, and ZIP formats.
 
 ```bash
 # Quick structural validation (fast)
@@ -204,6 +223,8 @@ Chunk Info:
 - `--chunk-size`: Average chunk size for content-defined dedup (e.g. `64KB`, `512KB`, actual chunks vary 1/4x-4x, min: `4KB`, `0=disabled`, default: 0, GDELTA only)
 - `--chunk-store-size`: Max in-memory dedup cache size (e.g. `1GB`, `500MB`, `0=unlimited`, default: 0, GDELTA only)
 - `--zip`: Create standard ZIP archive instead of GDELTA format (universally compatible, no deduplication)
+- `--dictionary`: Use dictionary compression (GDELTA03 format, auto-trains from input, best for many small files with common patterns)
+- `--no-gc`: Disable garbage collection during ZIP compression (reduces latency spikes, uses pooled buffers)
 - `--gitignore`: Respect `.gitignore` files to exclude matching paths (supports nested .gitignore files)
 - `--dry-run`: Simulate without writing
 - `--verbose`: Show detailed output including chunk statistics
@@ -267,6 +288,24 @@ unzip -d /restore backup_02.zip
 # ... etc
 ```
 
+### ZIP Performance Tuning
+
+**`--no-gc` flag**: Disables Go's garbage collector during ZIP compression for reduced latency spikes:
+- Forces a GC cleanup before starting compression
+- Disables GC during the compression phase
+- Uses pooled buffers to minimize heap allocations
+- GC is automatically re-enabled after compression completes
+
+**When to use `--no-gc`:**
+- Large archives with many files where GC pauses cause noticeable latency
+- Performance-critical backup jobs where consistent throughput matters
+- Systems with limited memory where GC pressure is high
+
+```bash
+# ZIP compression with GC disabled
+godelta compress -i /data -o backup.zip --zip --no-gc --threads 8
+```
+
 ## Gitignore Support
 
 The `--gitignore` flag enables automatic exclusion of files matching patterns defined in `.gitignore` files. This feature is useful for excluding build artifacts, dependencies, logs, and other generated files from backups.
@@ -308,6 +347,52 @@ godelta compress \
 - Directory-specific patterns (with trailing `/`) only match directories
 
 **Note:** `.gitignore` files themselves are **included** in the archive by default. To exclude them, add `.gitignore` to your `.gitignore` file.
+
+### GDELTA03 (Dictionary Compression)
+Custom format with auto-trained zstd dictionary for better compression of similar files:
+- **Header**: Magic number + dictionary size + file count
+- **Dictionary**: Auto-trained zstd dictionary (32KB-112KB based on input size)
+- **Entry metadata**: Path, original size, compressed size, data offset
+- **Compressed data**: Dictionary-compressed file contents
+
+**How it works:**
+1. Scans input files and collects samples for dictionary training
+2. Auto-computes optimal dictionary size based on total data volume
+3. Trains a zstd dictionary from the samples
+4. Compresses all files using the trained dictionary
+5. Stores dictionary in archive header for decompression
+
+**Dictionary size selection:**
+| Input Size | Dictionary Size |
+|------------|-----------------|
+| < 10 MB    | 32 KB          |
+| 10-100 MB  | 64 KB          |
+| > 100 MB   | 112 KB         |
+
+**When to use GDELTA03:**
+- Many small files with common patterns (config files, JSON, XML, logs)
+- Source code repositories with similar file structures
+- Collections of text files with shared vocabulary
+- Any dataset where files share common byte sequences
+
+**When NOT to use GDELTA03:**
+- Few large files (dictionary overhead not worth it)
+- Already compressed files (photos, videos, archives)
+- Encrypted or random data
+- Files with no common patterns
+
+**Limitations:**
+- Cannot be combined with `--chunk-size` (deduplication)
+- Cannot be combined with `--zip`
+- Dictionary training adds overhead for small datasets
+
+```bash
+# Dictionary compression for config files
+godelta compress -i /etc/configs -o configs.delta --dictionary --verbose
+
+# Dictionary compression for source code
+godelta compress -i /src/project -o source.delta --dictionary --level 9
+```
 
 ### GDELTA01 (Traditional)
 Custom format with zstandard compression (no deduplication):
@@ -396,10 +481,11 @@ Content-defined chunking (FastCDC):
 
 **Format selection:**
 - With `--zip`: ZIP format (deflate compression, universal compatibility)
-- Without `--chunk-size` or `--zip`: GDELTA01 (zstd compression, fastest)
+- With `--dictionary`: GDELTA03 (zstd + auto-trained dictionary)
 - With `--chunk-size N`: GDELTA02 (zstd + deduplication)
+- Default (no flags): GDELTA01 (zstd compression, fastest)
 
-**Note**: `--zip` and `--chunk-size` cannot be combined (ZIP does not support deduplication).
+**Note**: `--zip`, `--dictionary`, and `--chunk-size` are mutually exclusive.
 
 ## Architecture
 
@@ -688,6 +774,9 @@ type Options struct {
     ChunkSize       uint64   // Chunk size in bytes for dedup (0=disabled, min 4096, GDELTA only)
     ChunkStoreSize  uint64   // Max chunk store size in MB (0=unlimited, GDELTA only)
     UseZipFormat    bool     // Create ZIP archive instead of GDELTA (no deduplication)
+    UseDictionary   bool     // Use dictionary compression (GDELTA03 format)
+    DisableGC       bool     // Disable GC during ZIP compression (reduces latency)
+    UseGitignore    bool     // Respect .gitignore files
     DryRun          bool     // Simulate without writing
     Verbose         bool     // Detailed logging
     Quiet           bool     // Suppress output
@@ -756,7 +845,7 @@ type Options struct {
 ```go
 type Result struct {
     // Archive metadata
-    Format      Format // GDELTA01, GDELTA02, ZIP, or UNKNOWN
+    Format      Format // GDELTA01, GDELTA02, GDELTA03, ZIP, or UNKNOWN
     ArchivePath string // Path to verified archive
     ArchiveSize uint64 // Total archive size in bytes
     

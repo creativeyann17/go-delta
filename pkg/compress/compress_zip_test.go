@@ -310,3 +310,96 @@ func TestZipThreadSafety(t *testing.T) {
 		t.Errorf("Expected %d files in ZIP, got %d across all parts", numFiles, totalFilesInZip)
 	}
 }
+
+func TestZipWithDisableGC(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+	outputZip := filepath.Join(tempDir, "output.zip")
+	extractDir := filepath.Join(tempDir, "extracted")
+
+	if err := os.MkdirAll(inputDir, 0755); err != nil {
+		t.Fatalf("Failed to create input dir: %v", err)
+	}
+
+	// Create test files
+	testFiles := map[string]string{
+		"file1.txt":        "Hello, World!\n",
+		"file2.txt":        "This is a test file with some content.\n",
+		"subdir/file3.txt": "Nested file content.\n",
+	}
+
+	originalHashes := make(map[string]string)
+	for relPath, content := range testFiles {
+		fullPath := filepath.Join(inputDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatalf("Failed to create dir for %s: %v", relPath, err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write %s: %v", relPath, err)
+		}
+		hash := md5.Sum([]byte(content))
+		originalHashes[relPath] = fmt.Sprintf("%x", hash)
+	}
+
+	// Compress with DisableGC enabled
+	compressOpts := &Options{
+		InputPath:    inputDir,
+		OutputPath:   outputZip,
+		MaxThreads:   2,
+		Level:        5,
+		UseZipFormat: true,
+		DisableGC:    true, // Key difference: use pooled buffers
+		Verbose:      false,
+		Quiet:        true,
+	}
+
+	compressResult, err := Compress(compressOpts, nil)
+	if err != nil {
+		t.Fatalf("Compress failed: %v", err)
+	}
+
+	if compressResult.FilesProcessed != len(testFiles) {
+		t.Errorf("Expected %d files compressed, got %d", len(testFiles), compressResult.FilesProcessed)
+	}
+
+	// Find the ZIP file (multi-part)
+	baseOutput := strings.TrimSuffix(outputZip, ".zip")
+	firstPart := baseOutput + "_01.zip"
+	if _, err := os.Stat(firstPart); err != nil {
+		t.Fatalf("ZIP file not found: %v", err)
+	}
+
+	// Decompress and verify
+	decompressOpts := &decompress.Options{
+		InputPath:  firstPart,
+		OutputPath: extractDir,
+		Overwrite:  true,
+		Quiet:      true,
+	}
+
+	_, err = decompress.Decompress(decompressOpts, nil)
+	if err != nil {
+		t.Fatalf("Decompress failed: %v", err)
+	}
+
+	// Verify file contents match
+	for relPath, originalContent := range testFiles {
+		extractedPath := filepath.Join(extractDir, relPath)
+		extractedData, err := os.ReadFile(extractedPath)
+		if err != nil {
+			t.Errorf("Failed to read extracted file %s: %v", relPath, err)
+			continue
+		}
+
+		if string(extractedData) != originalContent {
+			t.Errorf("Content mismatch for %s:\nExpected: %q\nGot: %q",
+				relPath, originalContent, string(extractedData))
+		}
+
+		hash := md5.Sum(extractedData)
+		extractedHash := fmt.Sprintf("%x", hash)
+		if extractedHash != originalHashes[relPath] {
+			t.Errorf("Hash mismatch for %s", relPath)
+		}
+	}
+}
