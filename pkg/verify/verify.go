@@ -81,6 +81,10 @@ func Verify(opts *Options, progressCb ProgressCallback) (*Result, error) {
 		result.Format = FormatGDelta02
 		return result, verifyGDelta02(archiveFile, opts, progressCb, result)
 
+	case string(magic) == format.ArchiveMagic03:
+		result.Format = FormatGDelta03
+		return result, verifyGDelta03(archiveFile, opts, progressCb, result)
+
 	case magic[0] == 'P' && magic[1] == 'K':
 		result.Format = FormatZIP
 		// ZIP verification not implemented yet
@@ -424,6 +428,180 @@ func verifyGDelta02(archiveFile *os.File, opts *Options, progressCb ProgressCall
 
 	result.StructureValid = result.HeaderValid && result.IndexValid && result.MetadataValid &&
 		result.MissingChunks == 0 && result.DuplicatePaths == 0
+
+	if progressCb != nil {
+		progressCb(ProgressEvent{
+			Type:    EventComplete,
+			Current: result.FileCount,
+			Total:   result.FileCount,
+			Message: "Verification complete",
+		})
+	}
+
+	return nil
+}
+
+// verifyGDelta03 verifies a GDELTA03 archive with dictionary compression
+func verifyGDelta03(archiveFile *os.File, opts *Options, progressCb ProgressCallback, result *Result) error {
+	// Read header (file position is at start, magic not consumed)
+	version, dictSize, fileCount, err := format.ReadGDelta03Header(archiveFile)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("read header: %w", err))
+		return ErrInvalidHeader
+	}
+
+	if version != format.GDELTA03Version {
+		result.Errors = append(result.Errors, fmt.Errorf("unsupported version: %d", version))
+		return ErrInvalidHeader
+	}
+
+	result.HeaderValid = true
+	result.DictSize = dictSize
+	result.FileCount = int(fileCount)
+	result.MetadataValid = true
+
+	if progressCb != nil {
+		progressCb(ProgressEvent{
+			Type:    EventStart,
+			Total:   result.FileCount,
+			Message: fmt.Sprintf("Verifying %d files (dict: %d bytes)", fileCount, dictSize),
+		})
+	}
+
+	// Skip dictionary data
+	if dictSize > 0 {
+		if _, err := archiveFile.Seek(int64(dictSize), io.SeekCurrent); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("skip dictionary: %w", err))
+			return ErrTruncatedArchive
+		}
+	}
+
+	// Track seen paths for duplicate detection
+	seenPaths := make(map[string]bool)
+
+	// Header size: magic(8) + version(1) + dictSize(4) + fileCount(4) + reserved(4) = 21 bytes
+	const headerSize = 21
+
+	// Create decoder for data verification if needed
+	var decoder *zstd.Decoder
+	if opts.VerifyData && dictSize > 0 {
+		// Need to read the dictionary for verification
+		// Seek back to dictionary start (right after header)
+		dictStart := int64(headerSize)
+		if _, err := archiveFile.Seek(dictStart, io.SeekStart); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("seek to dictionary: %w", err))
+		} else {
+			dictionary := make([]byte, dictSize)
+			if _, err := io.ReadFull(archiveFile, dictionary); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("read dictionary: %w", err))
+			} else {
+				decoder, _ = zstd.NewReader(nil, zstd.WithDecoderDicts(dictionary))
+				if decoder != nil {
+					defer decoder.Close()
+				}
+			}
+		}
+	} else if opts.VerifyData {
+		decoder, _ = zstd.NewReader(nil)
+		if decoder != nil {
+			defer decoder.Close()
+		}
+	}
+
+	// Seek to file entries (after header and dictionary)
+	fileEntriesStart := int64(headerSize + int64(dictSize)) // header + dictionary
+	if _, err := archiveFile.Seek(fileEntriesStart, io.SeekStart); err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("seek to file entries: %w", err))
+		return ErrTruncatedArchive
+	}
+
+	// Read and verify each file entry
+	for i := 0; i < result.FileCount; i++ {
+		entry, err := format.ReadGDelta03FileEntry(archiveFile)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("file %d: %w", i, err))
+			result.MetadataValid = false
+			break
+		}
+
+		fileInfo := FileInfo{
+			Path:           entry.Path,
+			OriginalSize:   entry.OriginalSize,
+			CompressedSize: entry.CompressedSize,
+		}
+
+		// Check for duplicates
+		if seenPaths[entry.Path] {
+			result.DuplicatePaths++
+			result.Errors = append(result.Errors, fmt.Errorf("duplicate path: %s", entry.Path))
+		}
+		seenPaths[entry.Path] = true
+
+		// Track stats
+		result.TotalOrigSize += entry.OriginalSize
+		result.TotalCompSize += entry.CompressedSize
+		if entry.OriginalSize == 0 {
+			result.EmptyFiles++
+		}
+
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:     EventFileVerify,
+				FilePath: entry.Path,
+				Current:  i + 1,
+				Total:    result.FileCount,
+			})
+		}
+
+		// Verify data if requested
+		if opts.VerifyData && decoder != nil {
+			// Read compressed data
+			compressedData := make([]byte, entry.CompressedSize)
+			if _, err := io.ReadFull(archiveFile, compressedData); err != nil {
+				fileInfo.Error = fmt.Errorf("read compressed data: %w", err)
+				result.CorruptFiles++
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, fileInfo.Error))
+			} else {
+				// Try to decompress
+				decompressed, err := decoder.DecodeAll(compressedData, nil)
+				if err != nil {
+					fileInfo.Error = fmt.Errorf("decompress: %w", err)
+					result.CorruptFiles++
+					result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, fileInfo.Error))
+				} else if uint64(len(decompressed)) != entry.OriginalSize {
+					fileInfo.Error = fmt.Errorf("size mismatch: expected %d, got %d", entry.OriginalSize, len(decompressed))
+					result.CorruptFiles++
+					result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, fileInfo.Error))
+				} else {
+					fileInfo.DataValid = true
+					result.FilesVerified++
+				}
+			}
+			result.DataVerified = true
+		} else {
+			// Skip over compressed data
+			if _, err := archiveFile.Seek(int64(entry.CompressedSize), io.SeekCurrent); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("skip data for %s: %w", entry.Path, err))
+			}
+		}
+
+		result.Files = append(result.Files, fileInfo)
+	}
+
+	// Verify footer
+	footer := make([]byte, 8) // "ENDGDLT3"
+	n, err := archiveFile.Read(footer)
+	if err != nil && err != io.EOF {
+		result.Errors = append(result.Errors, fmt.Errorf("read footer: %w", err))
+	}
+	if n == 8 && string(footer) == format.ArchiveFooter03 {
+		result.FooterValid = true
+	} else {
+		result.FooterValid = false
+		result.Errors = append(result.Errors, fmt.Errorf("invalid footer: got %q, want %q", footer[:n], format.ArchiveFooter03))
+	}
+
+	result.StructureValid = result.HeaderValid && result.MetadataValid && result.DuplicatePaths == 0
 
 	if progressCb != nil {
 		progressCb(ProgressEvent{

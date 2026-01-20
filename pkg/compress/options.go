@@ -74,6 +74,13 @@ type Options struct {
 	// Default: false
 	UseZipFormat bool
 
+	// UseDictionary enables GDELTA03 dictionary-based compression
+	// Trains a zstd dictionary from input files for better compression
+	// Especially effective for many small files with common patterns
+	// Cannot be combined with ChunkSize or UseZipFormat
+	// Default: false
+	UseDictionary bool
+
 	// DryRun simulates compression without writing
 	DryRun bool
 
@@ -141,11 +148,19 @@ func (o *Options) Validate() error {
 		if o.ChunkSize > 0 {
 			return ErrZipNoChunking
 		}
+		if o.UseDictionary {
+			return ErrZipNoDictionary
+		}
 	} else {
 		// GDELTA mode uses zstd (1-22 levels)
 		if o.Level < 1 || o.Level > 22 {
 			return ErrInvalidLevelZstd
 		}
+	}
+
+	// Dictionary mode is mutually exclusive with chunking
+	if o.UseDictionary && o.ChunkSize > 0 {
+		return ErrDictionaryNoChunking
 	}
 
 	// Validate chunk size bounds if chunking is enabled

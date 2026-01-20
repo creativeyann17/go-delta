@@ -79,6 +79,10 @@ func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 			)
 
 		case EventFileStart:
+			// Skip creating bars for empty files (Total=0) - they complete instantly
+			if event.Total == 0 {
+				return
+			}
 			// Create a bar for this file
 			shortName := TruncateLeft(event.FilePath, 30)
 			bar := progress.AddBar(event.Total,
@@ -100,7 +104,14 @@ func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 
 		case EventFileComplete:
 			if bar, ok := fileBars.Load(event.FilePath); ok {
-				bar.(*mpb.Bar).SetCurrent(event.Total)
+				b := bar.(*mpb.Bar)
+				// Ensure bar completes - SetTotal then SetCurrent for proper completion
+				if event.Total > 0 {
+					b.SetCurrent(event.Total)
+				} else {
+					// For zero-size files, abort to remove the bar
+					b.Abort(true)
+				}
 				fileBars.Delete(event.FilePath)
 			}
 			if overallBar != nil {

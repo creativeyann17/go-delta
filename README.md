@@ -713,8 +713,7 @@ type Result struct {
 
 func (r *Result) CompressionRatio() float64  // Returns ratio as percentage
 func (r *Result) DedupRatio() float64        // Returns dedup ratio as percentage (DedupedChunks/TotalChunks)
-func (r *Result) DedupRatio() float64        // Returns dedup ratio as percentage
-func (r *Result) Success() bool               // Returns true if no errors
+func (r *Result) Success() bool              // Returns true if no errors
 ```
 
 ### Decompression

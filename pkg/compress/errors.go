@@ -19,6 +19,12 @@ var (
 	// ErrZipNoChunking is returned when trying to use chunking with ZIP format
 	ErrZipNoChunking = errors.New("chunk-based deduplication is not supported in ZIP format")
 
+	// ErrZipNoDictionary is returned when trying to use dictionary with ZIP format
+	ErrZipNoDictionary = errors.New("dictionary compression is not supported in ZIP format")
+
+	// ErrDictionaryNoChunking is returned when trying to use both dictionary and chunking
+	ErrDictionaryNoChunking = errors.New("dictionary compression cannot be combined with chunking")
+
 	// ErrInvalidParallelism is returned when parallelism strategy is invalid
 	ErrInvalidParallelism = errors.New("parallelism must be 'auto', 'folder', or 'file'")
 

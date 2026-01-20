@@ -9,6 +9,7 @@ type Format string
 const (
 	FormatGDelta01 Format = "GDELTA01"
 	FormatGDelta02 Format = "GDELTA02"
+	FormatGDelta03 Format = "GDELTA03"
 	FormatZIP      Format = "ZIP"
 	FormatUnknown  Format = "UNKNOWN"
 )
@@ -34,6 +35,9 @@ type Result struct {
 	ChunkSize     uint64 // Configured average chunk size (0 for non-chunked)
 	ChunkCount    uint64 // Total unique chunks in archive
 	TotalChunkRef uint64 // Total chunk references across all files
+
+	// GDELTA03-specific dictionary information
+	DictSize uint32 // Dictionary size in bytes (0 for non-dictionary)
 
 	// Data integrity (only populated when VerifyData=true)
 	DataVerified   bool // Whether data verification was performed
@@ -152,6 +156,11 @@ func (r *Result) Summary() string {
 		if r.ChunkDeduplicationRatio() > 0 {
 			s += fmt.Sprintf("  Dedup Ratio: %.1f%%\n", r.ChunkDeduplicationRatio())
 		}
+	}
+
+	if r.Format == FormatGDelta03 {
+		s += fmt.Sprintf("\nDictionary Info:\n")
+		s += fmt.Sprintf("  Dict Size:  %s\n", formatSize(uint64(r.DictSize)))
 	}
 
 	if r.DataVerified {

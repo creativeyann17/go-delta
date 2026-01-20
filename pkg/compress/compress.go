@@ -82,6 +82,7 @@ const (
 	EventFileComplete
 	EventComplete
 	EventError
+	EventDictTraining // Dictionary training phase for GDELTA03
 )
 
 // Compress compresses files from inputPath into an archive at outputPath
@@ -120,6 +121,11 @@ func Compress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	// Route to ZIP compression if UseZipFormat is enabled
 	if opts.UseZipFormat {
 		return result, compressToZip(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result, resolvedParallelism)
+	}
+
+	// Route to dictionary compression if UseDictionary is enabled
+	if opts.UseDictionary {
+		return result, compressWithDictionary(opts, progressCb, foldersToCompress, totalFiles, totalOrigSize, result, resolvedParallelism)
 	}
 
 	// Route to chunked compression if ChunkSize > 0

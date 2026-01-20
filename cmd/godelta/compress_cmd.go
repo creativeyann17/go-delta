@@ -30,6 +30,7 @@ func compressCmd() *cobra.Command {
 	var quiet bool
 	var compressLevel int
 	var useZipFormat bool
+	var useDictionary bool
 	var useGitignore bool
 
 	cmd := &cobra.Command{
@@ -116,6 +117,7 @@ func compressCmd() *cobra.Command {
 				ChunkStoreSize:  chunkStoreSizeKB / 1024, // Convert KB to MB (ChunkStoreSize is in MB)
 				Level:           compressLevel,
 				UseZipFormat:    useZipFormat,
+				UseDictionary:   useDictionary,
 				DryRun:          dryRun,
 				Verbose:         verbose,
 				Quiet:           quiet,
@@ -135,6 +137,8 @@ func compressCmd() *cobra.Command {
 			formatType := "GDELTA01"
 			if useZipFormat {
 				formatType = "ZIP"
+			} else if useDictionary {
+				formatType = "GDELTA03"
 			} else if opts.ChunkSize > 0 {
 				formatType = "GDELTA02"
 			}
@@ -209,6 +213,7 @@ func compressCmd() *cobra.Command {
 	cmd.Flags().StringVar(&chunkSizeStr, "chunk-size", "0", "Average chunk size for content-defined dedup (e.g. 64KB, 512KB, actual chunks vary 1/4x to 4x, 0=disabled)")
 	cmd.Flags().StringVar(&chunkStoreSizeStr, "chunk-store-size", "0", "Max in-memory dedup cache size (e.g. 1GB, 500MB, 0=auto ~25% RAM, does NOT limit archive size)")
 	cmd.Flags().BoolVar(&useZipFormat, "zip", false, "Create standard ZIP archive instead of GDELTA format (universally compatible)")
+	cmd.Flags().BoolVar(&useDictionary, "dictionary", false, "Use dictionary compression (GDELTA03 format, good for many small files with common patterns)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Simulate without writing anything")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Minimal output (overrides verbose)")

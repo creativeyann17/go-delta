@@ -71,6 +71,11 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 
 	// Route based on GDELTA format version
 	switch string(magic) {
+	case format.ArchiveMagic03:
+		// GDELTA03 with dictionary compression
+		err := decompressGDelta03(archiveFile, opts, progressCb, result)
+		return result, err
+
 	case format.ArchiveMagic02:
 		// GDELTA02 with chunking
 		err := decompressGDelta02(archiveFile, opts, progressCb, result)
