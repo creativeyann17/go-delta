@@ -34,6 +34,7 @@ build-all: install
 	@cd dist && tar -czf $(BINARY_NAME)-darwin-arm64.tar.gz  -C darwin-arm64  $(BINARY_NAME)     && echo "  - $(BINARY_NAME)-darwin-arm64.tar.gz"
 	@cd dist && zip -q $(BINARY_NAME)-windows-amd64.zip      -j windows-amd64/$(BINARY_NAME).exe && echo "  - $(BINARY_NAME)-windows-amd64.zip"
 	@rm -rf dist/linux-amd64 dist/linux-arm64 dist/darwin-amd64 dist/darwin-arm64 dist/windows-amd64
+	@cd dist && sha256sum *.tar.gz *.zip > checksums.txt && echo "  - checksums.txt"
 	@echo "✓ Compressed archives created"
 
 clean:
