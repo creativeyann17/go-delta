@@ -42,10 +42,15 @@ jobs:
       - name: Build all platforms
         run: make build-all
 
+      - name: Extract release notes
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          awk '/^## '"$VERSION"'$/{flag=1; next} /^## v/{flag=0} flag' CHANGELOG.md > release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          body_path: CHANGELOG.md
+          body_path: release-notes.md
           draft: false
           prerelease: false
