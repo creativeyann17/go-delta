@@ -197,15 +197,15 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 
 				file.Close()
 
-				// Notify file complete
+				// Notify file complete. CompressedSize stays 0: per-file
+				// compressed size is unknown inside a shared xz stream.
 				processedCount.Add(1)
 				if progressCb != nil {
 					progressCb(ProgressEvent{
-						Type:           EventFileComplete,
-						FilePath:       task.RelPath,
-						Current:        int64(task.OrigSize),
-						Total:          int64(task.OrigSize),
-						CompressedSize: task.OrigSize * 30 / 100, // Estimate
+						Type:     EventFileComplete,
+						FilePath: task.RelPath,
+						Current:  int64(task.OrigSize),
+						Total:    int64(task.OrigSize),
 					})
 				}
 			}

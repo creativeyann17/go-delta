@@ -223,15 +223,16 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 
 				file.Close()
 
-				// Notify file complete
+				// Notify file complete. CompressedSize stays 0: a ZIP entry's
+				// real compressed size is only known once the writer closes
+				// the entry, so reporting an estimate here would be a lie.
 				processedCount.Add(1)
 				if progressCb != nil {
 					progressCb(ProgressEvent{
-						Type:           EventFileComplete,
-						FilePath:       task.RelPath,
-						Current:        int64(task.OrigSize),
-						Total:          int64(task.OrigSize),
-						CompressedSize: task.OrigSize / 2, // Estimate
+						Type:     EventFileComplete,
+						FilePath: task.RelPath,
+						Current:  int64(task.OrigSize),
+						Total:    int64(task.OrigSize),
 					})
 				}
 			}

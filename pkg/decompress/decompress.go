@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/creativeyann17/go-delta/internal/format"
 	"github.com/creativeyann17/go-delta/pkg/godelta"
@@ -92,7 +93,10 @@ func Decompress(opts *Options, progressCb ProgressCallback) (*Result, error) {
 	}
 }
 
-// decompressGDelta01 handles the traditional GDELTA01 format
+// decompressGDelta01 handles the traditional GDELTA01 format.
+// Entry headers are read sequentially first, then files are decompressed in
+// parallel: every entry stores its data offset, so each worker reads from its
+// own archive file handle.
 func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb ProgressCallback, result *Result) error {
 	// Create archive reader
 	reader, err := format.NewArchiveReader(archiveFile)
@@ -115,16 +119,9 @@ func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb Progress
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	// Reusable zstd decoder, reset per file instead of recreated
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return fmt.Errorf("create zstd decoder: %w", err)
-	}
-	defer decoder.Close()
-
-	// Process files sequentially (reading entry headers and data in order)
-	var totalDecompSize, totalCompSize uint64
-
+	// Read all entry headers, skipping over the data sections
+	var entries []*format.FileEntry
+	var totalCompSize uint64
 	for i := 0; i < fileCount; i++ {
 		entry, err := reader.ReadFileEntry()
 		if err != nil {
@@ -132,42 +129,99 @@ func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb Progress
 			// Can't continue after a failed read - file position is unknown
 			break
 		}
-
+		entries = append(entries, entry)
 		totalCompSize += entry.CompressedSize
 
-		if progressCb != nil {
-			progressCb(ProgressEvent{
-				Type:     EventFileStart,
-				FilePath: entry.Path,
-				Total:    int64(entry.OriginalSize),
-			})
-		}
-
-		// Decompress directly from current position (entry data follows entry header)
-		decompSize, err := decompressFileFromCurrentPosition(archiveFile, entry, decoder, opts, progressCb)
-
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, err))
-			if progressCb != nil {
-				progressCb(ProgressEvent{
-					Type:     EventError,
-					FilePath: entry.Path,
-				})
-			}
-		} else {
-			totalDecompSize += decompSize
-			result.FilesProcessed++
-			if progressCb != nil {
-				progressCb(ProgressEvent{
-					Type:             EventFileComplete,
-					FilePath:         entry.Path,
-					Current:          int64(entry.OriginalSize),
-					Total:            int64(entry.OriginalSize),
-					DecompressedSize: decompSize,
-				})
+		// Skip the compressed data to reach the next entry header
+		if i < fileCount-1 {
+			if _, err := archiveFile.Seek(int64(entry.DataOffset+entry.CompressedSize), io.SeekStart); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("seek past entry %d: %w", i, err))
+				break
 			}
 		}
 	}
+
+	// Decompress entries in parallel
+	workers := opts.MaxThreads
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+
+	var mu sync.Mutex // guards result and totals
+	var totalDecompSize uint64
+	var wg sync.WaitGroup
+	entryCh := make(chan *format.FileEntry, workers*4)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker reads through its own file handle (independent seeks)
+			f, err := os.Open(opts.InputPath)
+			if err != nil {
+				mu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("open archive: %w", err))
+				mu.Unlock()
+				return
+			}
+			defer f.Close()
+
+			decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+			if err != nil {
+				mu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("create zstd decoder: %w", err))
+				mu.Unlock()
+				return
+			}
+			defer decoder.Close()
+
+			for entry := range entryCh {
+				if progressCb != nil {
+					progressCb(ProgressEvent{
+						Type:     EventFileStart,
+						FilePath: entry.Path,
+						Total:    int64(entry.OriginalSize),
+					})
+				}
+
+				decompSize, err := decompressEntryAt(f, entry, decoder, opts, progressCb)
+
+				if err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, err))
+					mu.Unlock()
+					if progressCb != nil {
+						progressCb(ProgressEvent{
+							Type:     EventError,
+							FilePath: entry.Path,
+						})
+					}
+					continue
+				}
+
+				mu.Lock()
+				totalDecompSize += decompSize
+				result.FilesProcessed++
+				mu.Unlock()
+				if progressCb != nil {
+					progressCb(ProgressEvent{
+						Type:             EventFileComplete,
+						FilePath:         entry.Path,
+						Current:          int64(entry.OriginalSize),
+						Total:            int64(entry.OriginalSize),
+						DecompressedSize: decompSize,
+					})
+				}
+			}
+		}()
+	}
+
+	for _, entry := range entries {
+		entryCh <- entry
+	}
+	close(entryCh)
+	wg.Wait()
 
 	result.CompressedSize = totalCompSize
 	result.DecompressedSize = totalDecompSize
@@ -185,9 +239,9 @@ func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb Progress
 	return nil
 }
 
-// decompressFileFromCurrentPosition decompresses a file from the current archive position
-// The archive format has entry headers followed immediately by compressed data
-func decompressFileFromCurrentPosition(
+// decompressEntryAt decompresses one file entry from its stored data offset.
+// The archive handle and decoder are owned by the calling worker.
+func decompressEntryAt(
 	archiveFile *os.File,
 	entry *format.FileEntry,
 	decoder *zstd.Decoder,
@@ -200,34 +254,31 @@ func decompressFileFromCurrentPosition(
 	// Check if file exists
 	if !opts.Overwrite {
 		if _, err := os.Stat(outPath); err == nil {
-			// File exists - skip the compressed data in the archive to maintain position
-			if _, err := archiveFile.Seek(int64(entry.CompressedSize), io.SeekCurrent); err != nil {
-				return 0, fmt.Errorf("skip compressed data: %w", err)
-			}
 			return 0, ErrFileExists
 		}
 	}
 
 	// Create parent directories
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
-		// Skip compressed data to maintain archive position
-		archiveFile.Seek(int64(entry.CompressedSize), io.SeekCurrent)
 		return 0, fmt.Errorf("create directories: %w", err)
 	}
 
 	// Create output file
 	outFile, err := os.Create(outPath)
 	if err != nil {
-		// Skip compressed data to maintain archive position
-		archiveFile.Seek(int64(entry.CompressedSize), io.SeekCurrent)
 		return 0, fmt.Errorf("create output file: %w", err)
 	}
 	defer outFile.Close()
 
-	// Create limited reader for compressed data (reads from current position)
+	// Seek to this entry's compressed data
+	if _, err := archiveFile.Seek(int64(entry.DataOffset), io.SeekStart); err != nil {
+		return 0, fmt.Errorf("seek to data: %w", err)
+	}
+
+	// Create limited reader for compressed data
 	limitedReader := io.LimitReader(archiveFile, int64(entry.CompressedSize))
 
-	// Reset the shared zstd decoder onto this entry's data
+	// Reset the worker's zstd decoder onto this entry's data
 	if err := decoder.Reset(limitedReader); err != nil {
 		return 0, fmt.Errorf("reset zstd decoder: %w", err)
 	}

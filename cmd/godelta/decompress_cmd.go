@@ -19,6 +19,7 @@ func init() {
 
 func decompressCmd() *cobra.Command {
 	var inputPath, outputPath string
+	var maxThreads int
 	var verbose bool
 	var quiet bool
 	var overwrite bool
@@ -52,6 +53,7 @@ func decompressCmd() *cobra.Command {
 			opts := &decompress.Options{
 				InputPath:  inputPath,
 				OutputPath: outputPath,
+				MaxThreads: maxThreads,
 				Verbose:    verbose,
 				Quiet:      quiet,
 				Overwrite:  overwrite,
@@ -111,6 +113,7 @@ func decompressCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&inputPath, "input", "i", "", "Input archive file (required)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", ".", "Output directory")
+	cmd.Flags().IntVarP(&maxThreads, "threads", "t", 0, "Max concurrent threads (0 = number of CPUs)")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show detailed output")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Minimal output (overrides verbose)")
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Overwrite existing files")
