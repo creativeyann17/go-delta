@@ -3,20 +3,19 @@ package compress
 
 import "sync"
 
-// Buffer pools for reduced allocations during compression.
-// These pools are used when DisableGC is enabled to minimize heap allocations.
+// readBufferSize is the file IO buffer size. Large enough to keep syscall
+// count low on multi-MB files without hurting many-small-file workloads
+// (buffers are pooled, not per-file allocations).
+const readBufferSize = 256 * 1024
 
-var (
-	// readBufferPool provides 32KB read buffers for file I/O
-	readBufferPool = sync.Pool{
-		New: func() any {
-			buf := make([]byte, 32*1024)
-			return &buf
-		},
-	}
-)
+var readBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, readBufferSize)
+		return &buf
+	},
+}
 
-// getReadBuffer returns a 32KB buffer from the pool
+// getReadBuffer returns a read buffer from the pool
 func getReadBuffer() []byte {
 	return *readBufferPool.Get().(*[]byte)
 }

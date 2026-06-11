@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/flate"
 )
@@ -78,12 +79,36 @@ func decompressZip(opts *Options, progressCb ProgressCallback, result *Result) e
 		})
 	}
 
-	// Extract each ZIP file in sequence
-	for _, zipPath := range zipPaths {
-		if err := extractZipFile(zipPath, opts, progressCb, result); err != nil {
-			return fmt.Errorf("extract %s: %w", zipPath, err)
-		}
+	// Extract ZIP parts in parallel (parts are independent archives with
+	// disjoint file sets, one worker per part)
+	workers := opts.MaxThreads
+	if workers > len(zipPaths) {
+		workers = len(zipPaths)
 	}
+
+	var mu sync.Mutex // guards result
+	var wg sync.WaitGroup
+	pathCh := make(chan string)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for zipPath := range pathCh {
+				if err := extractZipFile(zipPath, opts, progressCb, result, &mu); err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("extract %s: %w", zipPath, err))
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	for _, zipPath := range zipPaths {
+		pathCh <- zipPath
+	}
+	close(pathCh)
+	wg.Wait()
 
 	if progressCb != nil {
 		progressCb(ProgressEvent{
@@ -98,8 +123,9 @@ func decompressZip(opts *Options, progressCb ProgressCallback, result *Result) e
 	return nil
 }
 
-// extractZipFile extracts a single ZIP archive
-func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, result *Result) error {
+// extractZipFile extracts a single ZIP archive. It may run concurrently with
+// other parts; result mutations go through mu.
+func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, result *Result, mu *sync.Mutex) error {
 	// Open ZIP archive
 	zipReader, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -111,6 +137,15 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 	zipReader.RegisterDecompressor(zip.Deflate, func(r io.Reader) io.ReadCloser {
 		return flate.NewReader(r)
 	})
+
+	recordError := func(err error) {
+		mu.Lock()
+		result.Errors = append(result.Errors, err)
+		mu.Unlock()
+	}
+
+	// Reused across files in this part
+	buf := make([]byte, 256*1024)
 
 	// Extract each file
 	for _, zipFile := range zipReader.File {
@@ -129,8 +164,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 		// Check if file already exists
 		if !opts.Overwrite {
 			if _, err := os.Stat(outPath); err == nil {
-				err := fmt.Errorf("%s: file exists (use --overwrite to replace)", zipFile.Name)
-				result.Errors = append(result.Errors, err)
+				recordError(fmt.Errorf("%s: file exists (use --overwrite to replace)", zipFile.Name))
 
 				if progressCb != nil {
 					progressCb(ProgressEvent{
@@ -144,7 +178,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 
 		// Create parent directories
 		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("%s: mkdir: %w", zipFile.Name, err))
+			recordError(fmt.Errorf("%s: mkdir: %w", zipFile.Name, err))
 			if progressCb != nil {
 				progressCb(ProgressEvent{
 					Type:     EventError,
@@ -157,7 +191,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 		// Open file from ZIP
 		rc, err := zipFile.Open()
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("%s: open: %w", zipFile.Name, err))
+			recordError(fmt.Errorf("%s: open: %w", zipFile.Name, err))
 			if progressCb != nil {
 				progressCb(ProgressEvent{
 					Type:     EventError,
@@ -171,7 +205,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 		outFile, err := os.Create(outPath)
 		if err != nil {
 			rc.Close()
-			result.Errors = append(result.Errors, fmt.Errorf("%s: create: %w", zipFile.Name, err))
+			recordError(fmt.Errorf("%s: create: %w", zipFile.Name, err))
 			if progressCb != nil {
 				progressCb(ProgressEvent{
 					Type:     EventError,
@@ -183,7 +217,6 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 
 		// Copy data with progress tracking
 		var written, lastReported int64
-		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
 			nr, errRead := rc.Read(buf)
 			if nr > 0 {
@@ -191,7 +224,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 				if errWrite != nil {
 					outFile.Close()
 					rc.Close()
-					result.Errors = append(result.Errors, fmt.Errorf("%s: write: %w", zipFile.Name, errWrite))
+					recordError(fmt.Errorf("%s: write: %w", zipFile.Name, errWrite))
 					if progressCb != nil {
 						progressCb(ProgressEvent{
 							Type:     EventError,
@@ -219,7 +252,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 			if errRead != nil {
 				outFile.Close()
 				rc.Close()
-				result.Errors = append(result.Errors, fmt.Errorf("%s: read: %w", zipFile.Name, errRead))
+				recordError(fmt.Errorf("%s: read: %w", zipFile.Name, errRead))
 				if progressCb != nil {
 					progressCb(ProgressEvent{
 						Type:     EventError,
@@ -234,9 +267,11 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 		rc.Close()
 
 		// Track stats
+		mu.Lock()
 		result.FilesProcessed++
 		result.DecompressedSize += zipFile.UncompressedSize64
 		result.CompressedSize += zipFile.CompressedSize64
+		mu.Unlock()
 
 		// Notify file complete
 		if progressCb != nil {

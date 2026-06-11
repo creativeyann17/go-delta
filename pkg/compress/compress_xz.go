@@ -153,7 +153,7 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 					}
 
 					// Write file data with progress reporting
-					buf := make([]byte, 32*1024) // 32KB buffer
+					buf := getReadBuffer()
 					var written, lastReported int64
 					for {
 						nr, errRead := file.Read(buf)
@@ -190,6 +190,7 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 							break
 						}
 					}
+					putReadBuffer(buf)
 				} else if opts.DryRun {
 					// Dry-run: estimate compression (assume 30% for LZMA2)
 					totalCompSize.Add(task.OrigSize * 30 / 100)
