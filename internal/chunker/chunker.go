@@ -4,7 +4,7 @@ package chunker
 import (
 	"io"
 
-	"github.com/jotfs/fastcdc-go"
+	"github.com/creativeyann17/go-delta/internal/fastcdc"
 	"github.com/zeebo/blake3"
 )
 
@@ -107,17 +107,13 @@ func (c *Chunker) SplitWithCallback(reader io.Reader, callback ChunkCallback) er
 			return err
 		}
 
-		// Copy data (FastCDC reuses buffer)
-		data := make([]byte, len(fc.Data))
-		copy(data, fc.Data)
-
-		// Calculate BLAKE3 hash
-		hash := blake3.Sum256(data)
-
+		// No copy: fc.Data stays valid until the next call to Next(), and the
+		// callback runs synchronously before that. This avoids allocating and
+		// copying every byte of the input.
 		chunk := Chunk{
-			Data:     data,
-			Hash:     hash,
-			OrigSize: uint64(len(data)),
+			Data:     fc.Data,
+			Hash:     blake3.Sum256(fc.Data),
+			OrigSize: uint64(len(fc.Data)),
 		}
 
 		// Process chunk immediately via callback

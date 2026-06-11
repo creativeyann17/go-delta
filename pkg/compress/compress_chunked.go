@@ -2,15 +2,12 @@
 package compress
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/creativeyann17/go-delta/internal/chunker"
 	"github.com/creativeyann17/go-delta/internal/chunkstore"
@@ -72,41 +69,16 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 		writer = outFile
 
 		// Create temporary file for chunk data
+		// Note: no signal handler here — a library must not call os.Exit or
+		// install process-wide handlers; interrupt cleanup is the CLI's job.
 		chunkDataFile, err = os.CreateTemp("", "godelta-chunks-*.tmp")
 		if err != nil {
 			return fmt.Errorf("create temp file: %w", err)
 		}
-
-		// Track temp file path for signal handler
 		tempFilePath := chunkDataFile.Name()
-
-		// Cleanup function for temp file
-		cleanupTempFile := func() {
-			if chunkDataFile != nil {
-				chunkDataFile.Close()
-			}
-			os.Remove(tempFilePath)
-		}
-		defer cleanupTempFile()
-
-		// Setup signal handler to cleanup temp file on interruption
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		sigDone := make(chan struct{})
-		go func() {
-			select {
-			case <-sigChan:
-				cleanupTempFile()
-				os.Exit(1)
-			case <-sigDone:
-				// Normal completion, exit goroutine
-				return
-			}
-		}()
-		// Ensure we stop the signal handler when done
 		defer func() {
-			signal.Stop(sigChan)
-			close(sigDone)
+			chunkDataFile.Close()
+			os.Remove(tempFilePath)
 		}()
 
 		chunkDataWriter = chunkDataFile
@@ -119,7 +91,7 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 	var wg sync.WaitGroup
 
 	// Worker function to process a single file task
-	processFileTask := func(task fileTask, workerID int) {
+	processFileTask := func(task fileTask, workerID int, enc *zstd.Encoder) {
 		// Skip progress bar for 0-byte files (no progress to show)
 		if progressCb != nil && task.OrigSize > 0 {
 			progressCb(ProgressEvent{
@@ -173,7 +145,7 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 				chunkDataWriter,
 				&chunkOffsetMu,
 				&currentChunkOffset,
-				opts.Level,
+				enc,
 				progressCb,
 			)
 
@@ -211,6 +183,16 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 		}
 	}
 
+	// newChunkEncoder creates the per-worker encoder used via EncodeAll on
+	// small chunks; internal concurrency of 1 avoids goroutine oversubscription.
+	newChunkEncoder := func() (*zstd.Encoder, error) {
+		return zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(opts.Level)),
+			zstd.WithZeroFrames(true),
+			zstd.WithEncoderConcurrency(1),
+		)
+	}
+
 	if parallelism == ParallelismFolder {
 		// Folder-based parallelism: workers grab whole folders
 		folderCh := make(chan folderTask, len(filesToCompress))
@@ -220,9 +202,18 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 			go func(workerID int) {
 				defer wg.Done()
 
+				enc, err := newChunkEncoder()
+				if err != nil {
+					errorsMu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("create zstd encoder: %w", err))
+					errorsMu.Unlock()
+					return
+				}
+				defer enc.Close()
+
 				for folder := range folderCh {
 					for _, task := range folder.Files {
-						processFileTask(task, workerID)
+						processFileTask(task, workerID, enc)
 					}
 				}
 			}(i + 1)
@@ -236,36 +227,28 @@ func compressWithChunking(opts *Options, progressCb ProgressCallback, filesToCom
 			close(folderCh)
 		}()
 	} else {
-		// File-based parallelism: per-worker channels with folder affinity
-		// Files from the same folder go to the same worker for locality
-		workerChannels := make([]chan fileTask, opts.MaxThreads)
-		for i := range workerChannels {
-			workerChannels[i] = make(chan fileTask, 64)
-		}
+		// File-based parallelism: shared work queue, workers pull as they free up
+		taskCh := feedTasks(filesToCompress, opts.MaxThreads*16)
 
 		for i := 0; i < opts.MaxThreads; i++ {
 			wg.Add(1)
-			go func(workerID int, workerCh chan fileTask) {
+			go func(workerID int) {
 				defer wg.Done()
 
-				for task := range workerCh {
-					processFileTask(task, workerID)
+				enc, err := newChunkEncoder()
+				if err != nil {
+					errorsMu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("create zstd encoder: %w", err))
+					errorsMu.Unlock()
+					return
 				}
-			}(i+1, workerChannels[i])
-		}
+				defer enc.Close()
 
-		// Route files to workers based on folder hash (maintains folder locality)
-		go func() {
-			for _, folder := range filesToCompress {
-				workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
-				for _, task := range folder.Files {
-					workerChannels[workerIdx] <- task
+				for task := range taskCh {
+					processFileTask(task, workerID, enc)
 				}
-			}
-			for _, ch := range workerChannels {
-				close(ch)
-			}
-		}()
+			}(i + 1)
+		}
 	}
 
 	wg.Wait()
@@ -369,7 +352,7 @@ func compressFileChunked(
 	writer io.Writer,
 	writerMu *sync.Mutex,
 	currentOffset *uint64,
-	level int,
+	enc *zstd.Encoder,
 	progressCb ProgressCallback,
 ) (format.FileMetadata, error) {
 	// Open file
@@ -383,6 +366,9 @@ func compressFileChunked(
 	chunkHashes := make([][32]byte, 0, 8)
 	bytesRead := uint64(0)
 	var chunkErr error
+
+	// Reusable buffer for compressed chunk data (EncodeAll appends into it)
+	var compressBuf []byte
 
 	err = chunkerInstance.SplitWithCallback(file, func(chunk chunker.Chunk) error {
 		bytesRead += chunk.OrigSize
@@ -399,27 +385,10 @@ func compressFileChunked(
 		}
 
 		// Try to deduplicate
-		chunkInfo, isNew, err := store.GetOrAdd(chunk.Hash, chunk.OrigSize, func() (offset uint64, comprSize uint64, err error) {
-			// Compress the chunk
-			var compressed bytes.Buffer
-			enc, err := zstd.NewWriter(&compressed,
-				zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
-				zstd.WithZeroFrames(true),
-			)
-			if err != nil {
-				return 0, 0, fmt.Errorf("create zstd encoder: %w", err)
-			}
-
-			if _, err := enc.Write(chunk.Data); err != nil {
-				enc.Close()
-				return 0, 0, fmt.Errorf("compress chunk: %w", err)
-			}
-
-			if err := enc.Close(); err != nil {
-				return 0, 0, fmt.Errorf("close encoder: %w", err)
-			}
-
-			compressedData := compressed.Bytes()
+		chunkInfo, _, err := store.GetOrAdd(chunk.Hash, chunk.OrigSize, func() (offset uint64, comprSize uint64, err error) {
+			// Compress the chunk with the worker's reusable encoder
+			compressedData := enc.EncodeAll(chunk.Data, compressBuf[:0])
+			compressBuf = compressedData // keep grown capacity for next chunk
 
 			// Write directly to file (if writer is provided)
 			if writer != nil {
@@ -443,12 +412,6 @@ func compressFileChunked(
 		if err != nil {
 			chunkErr = fmt.Errorf("process chunk: %w", err)
 			return chunkErr
-		}
-
-		if isNew {
-			// New chunk stored
-		} else {
-			// Chunk deduplicated!
 		}
 
 		chunkHashes = append(chunkHashes, chunkInfo.Hash)

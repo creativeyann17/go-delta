@@ -59,7 +59,9 @@ func TestZipMultiPartArchive(t *testing.T) {
 		t.Errorf("Expected %d files compressed, got %d", numFiles, compressResult.FilesProcessed)
 	}
 
-	// Verify multi-part archives were created (archive_01.zip, archive_02.zip, etc.)
+	// Verify multi-part archives were created (archive_01.zip, archive_02.zip, ...)
+	// Parts are created lazily and numbered contiguously: between 1 and
+	// numThreads parts, never empty, no numbering gaps.
 	baseOutput := strings.TrimSuffix(outputZip, ".zip")
 	partsFound := 0
 	totalFilesInParts := 0
@@ -67,8 +69,7 @@ func TestZipMultiPartArchive(t *testing.T) {
 	for i := 1; i <= numThreads; i++ {
 		partPath := fmt.Sprintf("%s_%02d.zip", baseOutput, i)
 		if _, err := os.Stat(partPath); err != nil {
-			t.Errorf("Expected ZIP part %d not found: %s", i, partPath)
-			continue
+			break // Contiguous numbering: first missing part means no more parts
 		}
 
 		// Verify each part is a valid ZIP
@@ -78,6 +79,9 @@ func TestZipMultiPartArchive(t *testing.T) {
 		}
 
 		filesInPart := len(zipReader.File)
+		if filesInPart == 0 {
+			t.Errorf("Part %d is empty - empty parts should not be created", i)
+		}
 		totalFilesInParts += filesInPart
 		partsFound++
 
@@ -85,8 +89,8 @@ func TestZipMultiPartArchive(t *testing.T) {
 		zipReader.Close()
 	}
 
-	if partsFound != numThreads {
-		t.Errorf("Expected %d ZIP parts, found %d", numThreads, partsFound)
+	if partsFound < 1 || partsFound > numThreads {
+		t.Errorf("Expected between 1 and %d ZIP parts, found %d", numThreads, partsFound)
 	}
 
 	if totalFilesInParts != numFiles {
@@ -190,18 +194,24 @@ func TestZipMultiPartNaming(t *testing.T) {
 				t.Fatalf("Compress failed: %v", err)
 			}
 
-			// Verify naming pattern
+			// Verify naming pattern: parts are created lazily with contiguous
+			// numbering, so part _01 always exists and numbering has no gaps
 			baseOutput := strings.TrimSuffix(tc.outputPath, ".zip")
+			partsFound := 0
 			for i := 1; i <= tc.threads; i++ {
 				expectedPath := fmt.Sprintf("%s_%02d.zip", baseOutput, i)
 				if _, err := os.Stat(expectedPath); err != nil {
-					t.Errorf("Expected part %s not found", expectedPath)
+					break // Contiguous numbering: first missing part means no more parts
 				}
+				partsFound++
 
 				baseName := filepath.Base(expectedPath)
 				if !strings.HasPrefix(baseName, tc.expectedPrefix) {
 					t.Errorf("Expected part to start with %s, got %s", tc.expectedPrefix, baseName)
 				}
+			}
+			if partsFound < 1 || partsFound > tc.threads {
+				t.Errorf("Expected between 1 and %d parts, found %d", tc.threads, partsFound)
 			}
 		})
 	}

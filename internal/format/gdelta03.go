@@ -101,28 +101,21 @@ func ReadGDelta03HeaderAfterMagic(r io.Reader) (version byte, dictSize uint32, f
 	return version, dictSize, fileCount, nil
 }
 
-// WriteGDelta03FileEntry writes a file entry for GDELTA03
+// WriteGDelta03FileEntry writes a file entry for GDELTA03 as one write
 // Format: PathLen(2) + Path + OrigSize(8) + CompSize(8)
 func WriteGDelta03FileEntry(w io.Writer, relPath string, origSize, compSize uint64) error {
-	// Write path length
-	pathLen := uint16(len(relPath))
-	if err := binary.Write(w, binary.LittleEndian, pathLen); err != nil {
-		return fmt.Errorf("write path length: %w", err)
+	if len(relPath) > 65535 {
+		return fmt.Errorf("path too long for archive format (%d bytes, max 65535): %s", len(relPath), relPath)
 	}
 
-	// Write path
-	if _, err := w.Write([]byte(relPath)); err != nil {
-		return fmt.Errorf("write path: %w", err)
-	}
+	buf := make([]byte, 0, 2+len(relPath)+16)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(relPath)))
+	buf = append(buf, relPath...)
+	buf = binary.LittleEndian.AppendUint64(buf, origSize)
+	buf = binary.LittleEndian.AppendUint64(buf, compSize)
 
-	// Write original size
-	if err := binary.Write(w, binary.LittleEndian, origSize); err != nil {
-		return fmt.Errorf("write original size: %w", err)
-	}
-
-	// Write compressed size
-	if err := binary.Write(w, binary.LittleEndian, compSize); err != nil {
-		return fmt.Errorf("write compressed size: %w", err)
+	if _, err := w.Write(buf); err != nil {
+		return fmt.Errorf("write file entry: %w", err)
 	}
 
 	return nil
@@ -135,32 +128,25 @@ type GDelta03FileEntry struct {
 	CompressedSize uint64
 }
 
-// ReadGDelta03FileEntry reads a file entry from GDELTA03 archive
+// ReadGDelta03FileEntry reads a file entry from GDELTA03 archive (2 bulk reads)
 func ReadGDelta03FileEntry(r io.Reader) (*GDelta03FileEntry, error) {
 	entry := &GDelta03FileEntry{}
 
 	// Read path length
-	var pathLen uint16
-	if err := binary.Read(r, binary.LittleEndian, &pathLen); err != nil {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return nil, fmt.Errorf("read path length: %w", err)
 	}
+	pathLen := binary.LittleEndian.Uint16(lenBuf[:])
 
-	// Read path
-	pathBytes := make([]byte, pathLen)
-	if _, err := io.ReadFull(r, pathBytes); err != nil {
-		return nil, fmt.Errorf("read path: %w", err)
+	// Read path + original size + compressed size in one call
+	buf := make([]byte, int(pathLen)+16)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, fmt.Errorf("read file entry: %w", err)
 	}
-	entry.Path = string(pathBytes)
-
-	// Read original size
-	if err := binary.Read(r, binary.LittleEndian, &entry.OriginalSize); err != nil {
-		return nil, fmt.Errorf("read original size: %w", err)
-	}
-
-	// Read compressed size
-	if err := binary.Read(r, binary.LittleEndian, &entry.CompressedSize); err != nil {
-		return nil, fmt.Errorf("read compressed size: %w", err)
-	}
+	entry.Path = string(buf[:pathLen])
+	entry.OriginalSize = binary.LittleEndian.Uint64(buf[pathLen:])
+	entry.CompressedSize = binary.LittleEndian.Uint64(buf[pathLen+8:])
 
 	return entry, nil
 }

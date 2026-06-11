@@ -47,8 +47,11 @@ type Options struct {
 	// Default: "auto"
 	Parallelism Parallelism
 
-	// Maximum memory per thread before flushing to disk (bytes)
-	// 0 = unlimited (flush only at folder boundaries)
+	// Maximum memory per thread for in-memory compression (bytes).
+	// GDELTA01 mode: files up to this size are compressed in RAM and written
+	// straight to the archive, skipping the temp-file round trip (each worker
+	// may hold up to this much compressed data).
+	// 0 = always stream through temp files (bounded memory)
 	// Default: 0
 	MaxThreadMemory uint64
 

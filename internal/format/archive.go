@@ -35,36 +35,27 @@ func WriteArchiveHeader(w io.Writer, fileCount uint32) error {
 // The compressed size and data offset fields are initially zero and must be updated later
 // using UpdateFileEntry after compression.
 func WriteFileEntry(w io.WriteSeeker, relPath string, origSize uint64) (entryPos int64, err error) {
+	if len(relPath) > 65535 {
+		return 0, fmt.Errorf("path too long for archive format (%d bytes, max 65535): %s", len(relPath), relPath)
+	}
+
 	// Get current position
 	entryPos, err = w.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return 0, fmt.Errorf("get current position: %w", err)
 	}
 
-	// Write path length (uint16)
-	pathLen := uint16(len(relPath))
-	if err := binary.Write(w, binary.LittleEndian, pathLen); err != nil {
-		return 0, fmt.Errorf("write path length: %w", err)
-	}
+	// Entry header in one write: PathLen(2) + Path + OrigSize(8) +
+	// CompSize placeholder(8) + DataOffset placeholder(8)
+	buf := make([]byte, 0, 2+len(relPath)+24)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(relPath)))
+	buf = append(buf, relPath...)
+	buf = binary.LittleEndian.AppendUint64(buf, origSize)
+	buf = binary.LittleEndian.AppendUint64(buf, 0) // compressed size, updated later
+	buf = binary.LittleEndian.AppendUint64(buf, 0) // data offset, updated later
 
-	// Write path
-	if _, err := w.Write([]byte(relPath)); err != nil {
-		return 0, fmt.Errorf("write path: %w", err)
-	}
-
-	// Write original size
-	if err := binary.Write(w, binary.LittleEndian, origSize); err != nil {
-		return 0, fmt.Errorf("write orig size: %w", err)
-	}
-
-	// Write placeholder for compressed size (will be updated later)
-	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil {
-		return 0, fmt.Errorf("write comp size placeholder: %w", err)
-	}
-
-	// Write placeholder for data offset (will be updated later)
-	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil {
-		return 0, fmt.Errorf("write data offset placeholder: %w", err)
+	if _, err := w.Write(buf); err != nil {
+		return 0, fmt.Errorf("write file entry: %w", err)
 	}
 
 	return entryPos, nil
@@ -102,14 +93,12 @@ func UpdateFileEntry(w io.WriteSeeker, entryPos int64, compressedSize uint64, da
 		return fmt.Errorf("seek to comp size: %w", err)
 	}
 
-	// Write compressed size
-	if err := binary.Write(w, binary.LittleEndian, compressedSize); err != nil {
-		return fmt.Errorf("write comp size: %w", err)
-	}
-
-	// Write data offset
-	if err := binary.Write(w, binary.LittleEndian, dataOffset); err != nil {
-		return fmt.Errorf("write data offset: %w", err)
+	// Write compressed size + data offset in one call
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[:8], compressedSize)
+	binary.LittleEndian.PutUint64(buf[8:], dataOffset)
+	if _, err := w.Write(buf[:]); err != nil {
+		return fmt.Errorf("write comp size and data offset: %w", err)
 	}
 
 	// Restore original position

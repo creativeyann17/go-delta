@@ -97,12 +97,15 @@ func compressCmd() *cobra.Command {
 				}
 			}
 
-			// Auto-calculate thread memory if not specified
-			if threadMemoryKB == 0 {
-				threadMemoryKB = autoSizeFromSystemMemory(totalSystemMemoryKB)
+			// Auto-calculate thread memory if not specified.
+			// The budget is per worker (files up to this size are compressed
+			// in RAM), so split the auto value across threads to keep the
+			// total at ~autoSizePercent of system memory.
+			if threadMemoryKB == 0 && maxThreads > 0 {
+				threadMemoryKB = autoSizeFromSystemMemory(totalSystemMemoryKB) / uint64(maxThreads)
 				if threadMemoryKB > 0 {
-					log("Auto-calculated thread memory: %.0f MB (%d%% of system memory, capped at %.0f GB)",
-						float64(threadMemoryKB)/1024, autoSizePercent, float64(autoSizeMaxKB)/(1024*1024))
+					log("Auto-calculated thread memory: %.0f MB per thread (%d%% of system memory across %d threads, capped at %.0f GB)",
+						float64(threadMemoryKB)/1024, autoSizePercent, maxThreads, float64(autoSizeMaxKB)/(1024*1024))
 				}
 			}
 

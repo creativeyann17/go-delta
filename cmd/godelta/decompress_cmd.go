@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/vbauerster/mpb/v8"
@@ -28,10 +29,11 @@ func decompressCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Add extension if missing
 			if inputPath != "" {
-				hasZip := len(inputPath) >= 4 && inputPath[len(inputPath)-4:] == ".zip"
-				hasGdelta := len(inputPath) >= 7 && inputPath[len(inputPath)-7:] == ".gdelta"
+				hasZip := strings.HasSuffix(inputPath, ".zip")
+				hasGdelta := strings.HasSuffix(inputPath, ".gdelta")
+				hasXz := strings.HasSuffix(inputPath, ".xz")
 
-				if !hasZip && !hasGdelta {
+				if !hasZip && !hasGdelta && !hasXz {
 					// Check for multi-part ZIP first (e.g., archive_01.zip)
 					multiPartZip := inputPath + "_01.zip"
 					if _, err := os.Stat(multiPartZip); err == nil {

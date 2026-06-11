@@ -19,13 +19,23 @@ type chunkEntry struct {
 	lruNode  *list.Element
 }
 
+// inflightChunk tracks a chunk currently being written by another goroutine,
+// so concurrent writers of the same hash wait instead of compressing twice
+// (a duplicate write would leave orphan bytes in the archive).
+type inflightChunk struct {
+	done chan struct{} // closed when the write finishes
+	info ChunkInfo     // valid after done is closed, if err == nil
+	err  error
+}
+
 // Store maintains a thread-safe map of chunks for deduplication with bounded capacity
 type Store struct {
 	mu        sync.RWMutex
-	chunks    map[[32]byte]*chunkEntry // LRU cache for dedup lookups
-	allChunks map[[32]byte]ChunkInfo   // Complete index, never evicted
-	lruList   *list.List               // LRU list of hash keys
-	maxChunks int                      // Maximum chunks to keep in memory (0 = unlimited)
+	chunks    map[[32]byte]*chunkEntry    // LRU cache for dedup lookups
+	allChunks map[[32]byte]ChunkInfo      // Complete index, never evicted
+	inflight  map[[32]byte]*inflightChunk // Writes in progress
+	lruList   *list.List                  // LRU list of hash keys
+	maxChunks int                         // Maximum chunks to keep in memory (0 = unlimited)
 
 	// Statistics
 	totalChunks   atomic.Uint64
@@ -46,6 +56,7 @@ func NewStoreWithCapacity(maxChunks int) *Store {
 	return &Store{
 		chunks:    make(map[[32]byte]*chunkEntry),
 		allChunks: make(map[[32]byte]ChunkInfo), // Never evicted
+		inflight:  make(map[[32]byte]*inflightChunk),
 		lruList:   list.New(),
 		maxChunks: maxChunks,
 	}
@@ -58,86 +69,90 @@ func (s *Store) GetOrAdd(hash [32]byte, origSize uint64, writeFunc func() (offse
 	// Always count total chunks processed
 	s.totalChunks.Add(1)
 
-	// Fast path: check if chunk exists in LRU cache (read lock)
-	s.mu.RLock()
-	if entry, exists := s.chunks[hash]; exists {
-		info := entry.info
-		s.mu.RUnlock()
-
-		// Update LRU and refcount
+	for {
 		s.mu.Lock()
-		entry.refCount++
-		s.lruList.MoveToFront(entry.lruNode)
+
+		// Check LRU cache
+		if entry, exists := s.chunks[hash]; exists {
+			entry.refCount++
+			s.lruList.MoveToFront(entry.lruNode)
+			info := entry.info
+			s.mu.Unlock()
+
+			s.dedupedChunks.Add(1)
+			// Track compressed bytes saved, not original bytes
+			s.bytesSaved.Add(info.CompressedSize)
+			return info, false, nil
+		}
+
+		// Check permanent index (evicted from LRU but data already in archive)
+		if info, exists := s.allChunks[hash]; exists {
+			s.mu.Unlock()
+
+			s.dedupedChunks.Add(1)
+			s.bytesSaved.Add(info.CompressedSize)
+			return info, false, nil
+		}
+
+		// Another goroutine is writing this chunk right now: wait for it
+		// instead of compressing and writing the same data twice.
+		if fl, exists := s.inflight[hash]; exists {
+			s.mu.Unlock()
+			<-fl.done
+			if fl.err == nil {
+				s.dedupedChunks.Add(1)
+				s.bytesSaved.Add(fl.info.CompressedSize)
+				return fl.info, false, nil
+			}
+			// The writer failed; retry the whole lookup/write.
+			continue
+		}
+
+		// Chunk doesn't exist anywhere: register as in-flight and write it
+		fl := &inflightChunk{done: make(chan struct{})}
+		s.inflight[hash] = fl
 		s.mu.Unlock()
 
-		s.dedupedChunks.Add(1)
-		// Track compressed bytes saved, not original bytes
-		s.bytesSaved.Add(info.CompressedSize)
-		return info, false, nil
+		offset, comprSize, err := writeFunc()
+
+		s.mu.Lock()
+		delete(s.inflight, hash)
+		if err != nil {
+			s.mu.Unlock()
+			fl.err = err
+			close(fl.done)
+			return ChunkInfo{}, false, err
+		}
+
+		info := ChunkInfo{
+			Hash:           hash,
+			Offset:         offset,
+			CompressedSize: comprSize,
+			OriginalSize:   origSize,
+		}
+
+		// Add to permanent index (never evicted)
+		s.allChunks[hash] = info
+
+		// Evict LRU chunk if at capacity (only from cache, not from allChunks)
+		if s.maxChunks > 0 && len(s.chunks) >= s.maxChunks {
+			s.evictLRU()
+		}
+
+		// Add new chunk to LRU cache
+		lruNode := s.lruList.PushFront(hash)
+		s.chunks[hash] = &chunkEntry{
+			info:     info,
+			refCount: 1,
+			lruNode:  lruNode,
+		}
+		s.uniqueChunks.Add(1)
+		s.mu.Unlock()
+
+		fl.info = info
+		close(fl.done)
+		return info, true, nil
 	}
-
-	// Check if chunk exists in permanent index (evicted from LRU but data already in archive)
-	if info, exists := s.allChunks[hash]; exists {
-		s.mu.RUnlock()
-
-		s.dedupedChunks.Add(1)
-		s.bytesSaved.Add(info.CompressedSize)
-		return info, false, nil
-	}
-	s.mu.RUnlock()
-
-	// Chunk doesn't exist anywhere, write it
-	offset, comprSize, err := writeFunc()
-	if err != nil {
-		return ChunkInfo{}, false, err
-	}
-
-	info := ChunkInfo{
-		Hash:           hash,
-		Offset:         offset,
-		CompressedSize: comprSize,
-		OriginalSize:   origSize,
-	}
-
-	// Store the new chunk (write lock)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Double-check in case another goroutine added it
-	if entry, exists := s.chunks[hash]; exists {
-		// Another goroutine added it to LRU cache, use that one
-		entry.refCount++
-		s.lruList.MoveToFront(entry.lruNode)
-		s.dedupedChunks.Add(1)
-		s.bytesSaved.Add(entry.info.CompressedSize)
-		return entry.info, false, nil
-	}
-	if existingInfo, exists := s.allChunks[hash]; exists {
-		// Another goroutine added it to permanent index, use that one
-		s.dedupedChunks.Add(1)
-		s.bytesSaved.Add(existingInfo.CompressedSize)
-		return existingInfo, false, nil
-	}
-
-	// Add to permanent index (never evicted)
-	s.allChunks[hash] = info
-
-	// Evict LRU chunk if at capacity (only from cache, not from allChunks)
-	if s.maxChunks > 0 && len(s.chunks) >= s.maxChunks {
-		s.evictLRU()
-	}
-
-	// Add new chunk to LRU cache
-	lruNode := s.lruList.PushFront(hash)
-	s.chunks[hash] = &chunkEntry{
-		info:     info,
-		refCount: 1,
-		lruNode:  lruNode,
-	}
-
-	// Only increment unique chunks for new chunks (totalChunks already incremented above)
-	s.uniqueChunks.Add(1)
-	return info, true, nil
 }
 
 // evictLRU removes the least recently used chunk

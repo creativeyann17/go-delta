@@ -50,46 +50,29 @@ func (ar *ArchiveReader) FileCount() int {
 	return int(ar.fileCount)
 }
 
-// ReadFileEntry reads the next file entry from the archive
+// ReadFileEntry reads the next file entry from the archive (2 bulk reads)
 func (ar *ArchiveReader) ReadFileEntry() (*FileEntry, error) {
 	// Read path length
-	var pathLen uint16
-	if err := binary.Read(ar.r, binary.LittleEndian, &pathLen); err != nil {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(ar.r, lenBuf[:]); err != nil {
 		if err == io.EOF {
 			return nil, io.EOF
 		}
 		return nil, fmt.Errorf("read path length: %w", err)
 	}
+	pathLen := binary.LittleEndian.Uint16(lenBuf[:])
 
-	// Read path
-	pathBytes := make([]byte, pathLen)
-	if _, err := io.ReadFull(ar.r, pathBytes); err != nil {
-		return nil, fmt.Errorf("read path: %w", err)
-	}
-
-	// Read original size
-	var origSize uint64
-	if err := binary.Read(ar.r, binary.LittleEndian, &origSize); err != nil {
-		return nil, fmt.Errorf("read original size: %w", err)
-	}
-
-	// Read compressed size
-	var compSize uint64
-	if err := binary.Read(ar.r, binary.LittleEndian, &compSize); err != nil {
-		return nil, fmt.Errorf("read compressed size: %w", err)
-	}
-
-	// Read data offset
-	var dataOffset uint64
-	if err := binary.Read(ar.r, binary.LittleEndian, &dataOffset); err != nil {
-		return nil, fmt.Errorf("read data offset: %w", err)
+	// Read path + original size + compressed size + data offset in one call
+	buf := make([]byte, int(pathLen)+24)
+	if _, err := io.ReadFull(ar.r, buf); err != nil {
+		return nil, fmt.Errorf("read file entry: %w", err)
 	}
 
 	return &FileEntry{
-		Path:           string(pathBytes),
-		OriginalSize:   origSize,
-		CompressedSize: compSize,
-		DataOffset:     dataOffset,
+		Path:           string(buf[:pathLen]),
+		OriginalSize:   binary.LittleEndian.Uint64(buf[pathLen:]),
+		CompressedSize: binary.LittleEndian.Uint64(buf[pathLen+8:]),
+		DataOffset:     binary.LittleEndian.Uint64(buf[pathLen+16:]),
 	}, nil
 }
 

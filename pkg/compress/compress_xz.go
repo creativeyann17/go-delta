@@ -16,7 +16,7 @@ import (
 
 // compressToXz compresses files into multiple .tar.xz archives (one per thread) for true parallelism
 // Output: archive_01.tar.xz, archive_02.tar.xz, ..., archive_N.tar.xz
-func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result, parallelism Parallelism) error {
+func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result) error {
 	// Prepare output path base (remove .tar.xz or .xz extension if present)
 	baseOutputPath := opts.OutputPath
 	if strings.HasSuffix(baseOutputPath, ".tar.xz") {
@@ -32,11 +32,8 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 
 	var wg sync.WaitGroup
 
-	// Create per-worker channels with folder affinity
-	workerChannels := make([]chan fileTask, opts.MaxThreads)
-	for i := range workerChannels {
-		workerChannels[i] = make(chan fileTask, 64)
-	}
+	// Shared task channel: workers pull files as they become free
+	taskCh := feedTasks(foldersToCompress, opts.MaxThreads*16)
 
 	// Track archive files created for later cleanup/stats
 	type archiveFileInfo struct {
@@ -46,10 +43,14 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 	archiveFiles := make([]archiveFileInfo, opts.MaxThreads)
 	var archiveFilesMu sync.Mutex
 
-	// Start worker goroutines - each creates its own .tar.xz file
+	// Parts are numbered contiguously in order of first file received, so
+	// idle workers don't leave empty (or gap-numbered) archives behind.
+	var partCounter atomic.Int32
+
+	// Start worker goroutines - each creates its own .tar.xz file on first use
 	for i := 0; i < opts.MaxThreads; i++ {
 		wg.Add(1)
-		go func(workerID int, workerCh chan fileTask) {
+		go func(workerID int) {
 			defer wg.Done()
 
 			var workerTarWriter *tar.Writer
@@ -57,28 +58,25 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 			var workerFile *os.File
 			var workerFilePath string
 
-			if !opts.DryRun {
-				// Generate worker-specific filename: archive_01.tar.xz, archive_02.tar.xz, etc.
-				workerFilePath = fmt.Sprintf("%s_%02d.tar.xz", baseOutputPath, workerID+1)
+			// ensureArchive lazily creates this worker's archive on first task
+			ensureArchive := func() error {
+				if workerFile != nil {
+					return nil
+				}
+				partNum := int(partCounter.Add(1))
+				workerFilePath = fmt.Sprintf("%s_%02d.tar.xz", baseOutputPath, partNum)
 
 				// Ensure output directory exists
 				outputDir := filepath.Dir(workerFilePath)
 				if err := os.MkdirAll(outputDir, 0755); err != nil {
-					errorsMu.Lock()
-					result.Errors = append(result.Errors, fmt.Errorf("worker %d: create output directory: %w", workerID, err))
-					errorsMu.Unlock()
-					return
+					return fmt.Errorf("worker %d: create output directory: %w", workerID, err)
 				}
 
 				var err error
 				workerFile, err = os.Create(workerFilePath)
 				if err != nil {
-					errorsMu.Lock()
-					result.Errors = append(result.Errors, fmt.Errorf("worker %d: create archive: %w", workerID, err))
-					errorsMu.Unlock()
-					return
+					return fmt.Errorf("worker %d: create archive: %w", workerID, err)
 				}
-				defer workerFile.Close()
 
 				// Create XZ writer with compression level
 				xzConfig := xz.WriterConfig{
@@ -90,23 +88,29 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 
 				workerXzWriter, err = xzConfig.NewWriter(workerFile)
 				if err != nil {
-					errorsMu.Lock()
-					result.Errors = append(result.Errors, fmt.Errorf("worker %d: create xz writer: %w", workerID, err))
-					errorsMu.Unlock()
-					return
+					workerFile.Close()
+					workerFile = nil
+					return fmt.Errorf("worker %d: create xz writer: %w", workerID, err)
 				}
-				defer workerXzWriter.Close()
 
 				workerTarWriter = tar.NewWriter(workerXzWriter)
-				defer workerTarWriter.Close()
 
 				// Track archive file for stats
 				archiveFilesMu.Lock()
 				archiveFiles[workerID].path = workerFilePath
 				archiveFilesMu.Unlock()
+				return nil
 			}
 
-			for task := range workerCh {
+			for task := range taskCh {
+				if !opts.DryRun {
+					if err := ensureArchive(); err != nil {
+						errorsMu.Lock()
+						result.Errors = append(result.Errors, err)
+						errorsMu.Unlock()
+						return
+					}
+				}
 				// Skip progress bar for 0-byte files
 				if progressCb != nil && task.OrigSize > 0 {
 					progressCb(ProgressEvent{
@@ -150,7 +154,7 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 
 					// Write file data with progress reporting
 					buf := make([]byte, 32*1024) // 32KB buffer
-					var written int64
+					var written, lastReported int64
 					for {
 						nr, errRead := file.Read(buf)
 						if nr > 0 {
@@ -164,8 +168,9 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 							}
 							written += int64(nw)
 
-							// Report progress
-							if progressCb != nil {
+							// Report progress (throttled; EventFileComplete finishes the bar)
+							if progressCb != nil && written-lastReported >= progressReportStep {
+								lastReported = written
 								progressCb(ProgressEvent{
 									Type:     EventFileProgress,
 									FilePath: task.RelPath,
@@ -238,21 +243,8 @@ func compressToXz(opts *Options, progressCb ProgressCallback, foldersToCompress 
 					archiveFilesMu.Unlock()
 				}
 			}
-		}(i, workerChannels[i])
+		}(i)
 	}
-
-	// Route files to workers based on folder hash (maintains folder locality)
-	go func() {
-		for _, folder := range foldersToCompress {
-			workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
-			for _, task := range folder.Files {
-				workerChannels[workerIdx] <- task
-			}
-		}
-		for _, ch := range workerChannels {
-			close(ch)
-		}
-	}()
 
 	// Wait for all workers to complete
 	wg.Wait()

@@ -115,6 +115,13 @@ func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb Progress
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
+	// Reusable zstd decoder, reset per file instead of recreated
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return fmt.Errorf("create zstd decoder: %w", err)
+	}
+	defer decoder.Close()
+
 	// Process files sequentially (reading entry headers and data in order)
 	var totalDecompSize, totalCompSize uint64
 
@@ -137,7 +144,7 @@ func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb Progress
 		}
 
 		// Decompress directly from current position (entry data follows entry header)
-		decompSize, err := decompressFileFromCurrentPosition(archiveFile, entry, opts, progressCb)
+		decompSize, err := decompressFileFromCurrentPosition(archiveFile, entry, decoder, opts, progressCb)
 
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, err))
@@ -183,6 +190,7 @@ func decompressGDelta01(archiveFile *os.File, opts *Options, progressCb Progress
 func decompressFileFromCurrentPosition(
 	archiveFile *os.File,
 	entry *format.FileEntry,
+	decoder *zstd.Decoder,
 	opts *Options,
 	progressCb ProgressCallback,
 ) (decompressedSize uint64, err error) {
@@ -219,20 +227,19 @@ func decompressFileFromCurrentPosition(
 	// Create limited reader for compressed data (reads from current position)
 	limitedReader := io.LimitReader(archiveFile, int64(entry.CompressedSize))
 
-	// Create zstd decoder
-	decoder, err := zstd.NewReader(limitedReader)
-	if err != nil {
-		return 0, fmt.Errorf("create zstd decoder: %w", err)
+	// Reset the shared zstd decoder onto this entry's data
+	if err := decoder.Reset(limitedReader); err != nil {
+		return 0, fmt.Errorf("reset zstd decoder: %w", err)
 	}
-	defer decoder.Close()
 
-	// Progress tracking writer
-	written := uint64(0)
+	// Progress tracking writer (throttled; EventFileComplete finishes the bar)
+	var written, lastReported uint64
 	proxy := &godelta.ProgressWriter{
 		Writer: outFile,
 		OnWrite: func(n int) {
 			written += uint64(n)
-			if progressCb != nil {
+			if progressCb != nil && written-lastReported >= progressReportStep {
+				lastReported = written
 				progressCb(ProgressEvent{
 					Type:         EventFileProgress,
 					FilePath:     entry.Path,

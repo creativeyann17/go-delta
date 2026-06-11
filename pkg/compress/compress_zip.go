@@ -3,7 +3,6 @@ package compress
 
 import (
 	"archive/zip"
-	"compress/flate"
 	"fmt"
 	"io"
 	"os"
@@ -13,11 +12,18 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/klauspost/compress/flate"
 )
+
+// progressReportStep is the minimum number of bytes between two
+// EventFileProgress emissions. Reporting on every 32KB read is measurably
+// expensive on fast disks; 1 MiB keeps bars smooth at a fraction of the cost.
+const progressReportStep = 1 << 20
 
 // compressToZip compresses files into multiple ZIP archives (one per thread) for true parallelism
 // Output: archive_01.zip, archive_02.zip, ..., archive_N.zip
-func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result, parallelism Parallelism) error {
+func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress []folderTask, totalFiles int, totalOrigSize uint64, result *Result) error {
 	// GC control: disable GC during compression if requested
 	if opts.DisableGC {
 		// Force GC before disabling to start with a clean heap
@@ -39,12 +45,10 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 
 	var wg sync.WaitGroup
 
-	// Create per-worker channels with folder affinity
-	// Files from the same folder go to the same worker/ZIP for locality
-	workerChannels := make([]chan fileTask, opts.MaxThreads)
-	for i := range workerChannels {
-		workerChannels[i] = make(chan fileTask, 64)
-	}
+	// Shared task channel: workers pull files as they become free.
+	// Folder-hash affinity routing was dropped because it sent every file of a
+	// folder to one worker — a flat input directory ran single-threaded.
+	taskCh := make(chan fileTask, opts.MaxThreads*16)
 
 	// Track ZIP files created for later cleanup/stats
 	type zipFileInfo struct {
@@ -54,42 +58,41 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 	zipFiles := make([]zipFileInfo, opts.MaxThreads)
 	var zipFilesMu sync.Mutex
 
-	// Start worker goroutines - each creates its own ZIP file
+	// Parts are numbered contiguously in order of first file received, so
+	// idle workers don't leave empty (or gap-numbered) archives behind.
+	var partCounter atomic.Int32
+
+	// Start worker goroutines - each creates its own ZIP file on first use
 	for i := 0; i < opts.MaxThreads; i++ {
 		wg.Add(1)
-		go func(workerID int, workerCh chan fileTask) {
+		go func(workerID int) {
 			defer wg.Done()
 
-			// Create worker-specific ZIP file
 			var workerZipWriter *zip.Writer
 			var workerZipFile *os.File
 			var workerZipPath string
 
-			if !opts.DryRun {
-				// Generate worker-specific ZIP filename: archive_01.zip, archive_02.zip, etc.
-				workerZipPath = fmt.Sprintf("%s_%02d.zip", baseOutputPath, workerID+1)
+			// ensureArchive lazily creates this worker's ZIP file on first task
+			ensureArchive := func() error {
+				if workerZipFile != nil {
+					return nil
+				}
+				partNum := int(partCounter.Add(1))
+				workerZipPath = fmt.Sprintf("%s_%02d.zip", baseOutputPath, partNum)
 
 				// Ensure output directory exists
 				outputDir := filepath.Dir(workerZipPath)
 				if err := os.MkdirAll(outputDir, 0755); err != nil {
-					errorsMu.Lock()
-					result.Errors = append(result.Errors, fmt.Errorf("worker %d: create output directory: %w", workerID, err))
-					errorsMu.Unlock()
-					return
+					return fmt.Errorf("worker %d: create output directory: %w", workerID, err)
 				}
 
 				var err error
 				workerZipFile, err = os.Create(workerZipPath)
 				if err != nil {
-					errorsMu.Lock()
-					result.Errors = append(result.Errors, fmt.Errorf("worker %d: create zip: %w", workerID, err))
-					errorsMu.Unlock()
-					return
+					return fmt.Errorf("worker %d: create zip: %w", workerID, err)
 				}
-				defer workerZipFile.Close()
 
 				workerZipWriter = zip.NewWriter(workerZipFile)
-				defer workerZipWriter.Close()
 
 				// Register custom deflate compressor with our compression level
 				workerZipWriter.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
@@ -107,9 +110,18 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 				zipFilesMu.Lock()
 				zipFiles[workerID].path = workerZipPath
 				zipFilesMu.Unlock()
+				return nil
 			}
 
-			for task := range workerCh {
+			for task := range taskCh {
+				if !opts.DryRun {
+					if err := ensureArchive(); err != nil {
+						errorsMu.Lock()
+						result.Errors = append(result.Errors, err)
+						errorsMu.Unlock()
+						return
+					}
+				}
 				// Skip progress bar for 0-byte files (no progress to show)
 				if progressCb != nil && task.OrigSize > 0 {
 					progressCb(ProgressEvent{
@@ -167,7 +179,7 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 						buf = make([]byte, 32*1024) // 32KB buffer
 						returnBuf = func() {}
 					}
-					var written int64
+					var written, lastReported int64
 					for {
 						nr, errRead := file.Read(buf)
 						if nr > 0 {
@@ -181,8 +193,9 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 							}
 							written += int64(nw)
 
-							// Report progress
-							if progressCb != nil {
+							// Report progress (throttled; EventFileComplete finishes the bar)
+							if progressCb != nil && written-lastReported >= progressReportStep {
+								lastReported = written
 								progressCb(ProgressEvent{
 									Type:     EventFileProgress,
 									FilePath: task.RelPath,
@@ -246,21 +259,17 @@ func compressToZip(opts *Options, progressCb ProgressCallback, foldersToCompress
 					zipFilesMu.Unlock()
 				}
 			}
-		}(i, workerChannels[i])
+		}(i)
 	}
 
-	// Route files to workers based on folder hash (maintains folder locality)
-	// Files from the same folder will end up in the same ZIP archive
+	// Feed all files into the shared channel, folder by folder
 	go func() {
 		for _, folder := range foldersToCompress {
-			workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
 			for _, task := range folder.Files {
-				workerChannels[workerIdx] <- task
+				taskCh <- task
 			}
 		}
-		for _, ch := range workerChannels {
-			close(ch)
-		}
+		close(taskCh)
 	}()
 
 	// Wait for all workers to complete

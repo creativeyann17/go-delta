@@ -223,7 +223,7 @@ func compressWithDictionary(
 	}
 
 	// Worker function to compress a single file
-	processFileTask := func(task fileTask) (tempPath string, comprSize uint64, err error) {
+	processFileTask := func(task fileTask, enc *zstd.Encoder) (tempPath string, comprSize uint64, err error) {
 		if progressCb != nil && task.OrigSize > 0 {
 			progressCb(ProgressEvent{
 				Type:     EventFileStart,
@@ -240,7 +240,7 @@ func compressWithDictionary(
 		tempPath = tempFile.Name()
 
 		// Compress with dictionary
-		compressedSize, err := compressFileWithDict(task, tempFile, dictionary, opts.Level, progressCb)
+		compressedSize, err := compressFileWithDict(task, tempFile, enc, progressCb)
 		tempFile.Close()
 
 		if err != nil {
@@ -249,6 +249,45 @@ func compressWithDictionary(
 		}
 
 		return tempPath, compressedSize, nil
+	}
+
+	// handleTask compresses one file and appends it to the archive
+	handleTask := func(task fileTask, enc *zstd.Encoder) {
+		tempPath, comprSize, err := processFileTask(task, enc)
+
+		if err != nil {
+			errorsMu.Lock()
+			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+			errorsMu.Unlock()
+			if progressCb != nil {
+				progressCb(ProgressEvent{Type: EventError, FilePath: task.RelPath})
+			}
+			return
+		}
+
+		err = writeFileEntry(task, tempPath, comprSize)
+		os.Remove(tempPath)
+		if err != nil {
+			errorsMu.Lock()
+			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
+			errorsMu.Unlock()
+			if progressCb != nil {
+				progressCb(ProgressEvent{Type: EventError, FilePath: task.RelPath})
+			}
+			return
+		}
+		atomic.AddUint64(&totalComprSize, comprSize)
+
+		processedCount.Add(1)
+		if progressCb != nil {
+			progressCb(ProgressEvent{
+				Type:           EventFileComplete,
+				FilePath:       task.RelPath,
+				Current:        int64(task.OrigSize),
+				Total:          int64(task.OrigSize),
+				CompressedSize: comprSize,
+			})
+		}
 	}
 
 	if resolvedParallelism == ParallelismFolder {
@@ -260,38 +299,18 @@ func compressWithDictionary(
 			go func() {
 				defer wg.Done()
 
+				enc, err := newWorkerEncoder(opts.Level, opts.MaxThreads, dictionary)
+				if err != nil {
+					errorsMu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("create zstd encoder: %w", err))
+					errorsMu.Unlock()
+					return
+				}
+				defer enc.Close()
+
 				for folder := range folderCh {
 					for _, task := range folder.Files {
-						tempPath, comprSize, err := processFileTask(task)
-
-						if err != nil {
-							errorsMu.Lock()
-							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
-							errorsMu.Unlock()
-							if progressCb != nil {
-								progressCb(ProgressEvent{Type: EventError, FilePath: task.RelPath})
-							}
-							continue
-						}
-
-						if err := writeFileEntry(task, tempPath, comprSize); err != nil {
-							errorsMu.Lock()
-							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
-							errorsMu.Unlock()
-						}
-						os.Remove(tempPath)
-						atomic.AddUint64(&totalComprSize, comprSize)
-
-						processedCount.Add(1)
-						if progressCb != nil {
-							progressCb(ProgressEvent{
-								Type:           EventFileComplete,
-								FilePath:       task.RelPath,
-								Current:        int64(task.OrigSize),
-								Total:          int64(task.OrigSize),
-								CompressedSize: comprSize,
-							})
-						}
+						handleTask(task, enc)
 					}
 				}
 			}()
@@ -304,63 +323,28 @@ func compressWithDictionary(
 			close(folderCh)
 		}()
 	} else {
-		// File-based parallelism with folder affinity
-		workerChannels := make([]chan fileTask, opts.MaxThreads)
-		for i := range workerChannels {
-			workerChannels[i] = make(chan fileTask, 64)
-		}
+		// File-based parallelism: shared work queue, workers pull as they free up
+		taskCh := feedTasks(foldersToCompress, opts.MaxThreads*16)
 
 		for i := 0; i < opts.MaxThreads; i++ {
 			wg.Add(1)
-			go func(workerCh chan fileTask) {
+			go func() {
 				defer wg.Done()
 
-				for task := range workerCh {
-					tempPath, comprSize, err := processFileTask(task)
-
-					if err != nil {
-						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
-						errorsMu.Unlock()
-						if progressCb != nil {
-							progressCb(ProgressEvent{Type: EventError, FilePath: task.RelPath})
-						}
-						continue
-					}
-
-					if err := writeFileEntry(task, tempPath, comprSize); err != nil {
-						errorsMu.Lock()
-						result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
-						errorsMu.Unlock()
-					}
-					os.Remove(tempPath)
-					atomic.AddUint64(&totalComprSize, comprSize)
-
-					processedCount.Add(1)
-					if progressCb != nil {
-						progressCb(ProgressEvent{
-							Type:           EventFileComplete,
-							FilePath:       task.RelPath,
-							Current:        int64(task.OrigSize),
-							Total:          int64(task.OrigSize),
-							CompressedSize: comprSize,
-						})
-					}
+				enc, err := newWorkerEncoder(opts.Level, opts.MaxThreads, dictionary)
+				if err != nil {
+					errorsMu.Lock()
+					result.Errors = append(result.Errors, fmt.Errorf("create zstd encoder: %w", err))
+					errorsMu.Unlock()
+					return
 				}
-			}(workerChannels[i])
+				defer enc.Close()
+
+				for task := range taskCh {
+					handleTask(task, enc)
+				}
+			}()
 		}
-
-		go func() {
-			for _, folder := range foldersToCompress {
-				workerIdx := int(folderHash(folder.FolderPath) % uint64(opts.MaxThreads))
-				for _, task := range folder.Files {
-					workerChannels[workerIdx] <- task
-				}
-			}
-			for _, ch := range workerChannels {
-				close(ch)
-			}
-		}()
 	}
 
 	wg.Wait()
@@ -527,12 +511,12 @@ func readFileSample(path string, maxBytes int64) ([]byte, error) {
 	return sample[:n], nil
 }
 
-// compressFileWithDict compresses a file using a pre-trained dictionary
+// compressFileWithDict compresses a file using the worker's dictionary-loaded
+// encoder, reused across files via Reset.
 func compressFileWithDict(
 	task fileTask,
 	writer io.Writer,
-	dictionary []byte,
-	level int,
+	enc *zstd.Encoder,
 	progressCb ProgressCallback,
 ) (uint64, error) {
 	src, err := os.Open(task.AbsPath)
@@ -550,30 +534,16 @@ func compressFileWithDict(
 		},
 	}
 
-	// Create encoder options
-	encOpts := []zstd.EOption{
-		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
-		zstd.WithZeroFrames(true),
-	}
+	enc.Reset(targetWriter)
 
-	// Add dictionary if present
-	if len(dictionary) > 0 {
-		encOpts = append(encOpts, zstd.WithEncoderDict(dictionary))
-	}
-
-	// Create encoder with dictionary
-	enc, err := zstd.NewWriter(targetWriter, encOpts...)
-	if err != nil {
-		return 0, fmt.Errorf("create zstd writer: %w", err)
-	}
-
-	// Progress tracking
-	uncompressedRead := uint64(0)
+	// Progress tracking (throttled; EventFileComplete finishes the bar)
+	var uncompressedRead, lastReported uint64
 	proxy := &godelta.ProgressReader{
 		Reader: src,
 		OnRead: func(n int) {
 			uncompressedRead += uint64(n)
-			if progressCb != nil {
+			if progressCb != nil && uncompressedRead-lastReported >= progressReportStep {
+				lastReported = uncompressedRead
 				progressCb(ProgressEvent{
 					Type:         EventFileProgress,
 					FilePath:     task.RelPath,
@@ -608,6 +578,12 @@ func dryRunDictCompression(
 ) error {
 	var totalComprSize uint64
 
+	enc, err := newWorkerEncoder(opts.Level, 1, dictionary)
+	if err != nil {
+		return fmt.Errorf("create zstd encoder: %w", err)
+	}
+	defer enc.Close()
+
 	for _, task := range files {
 		if progressCb != nil && task.OrigSize > 0 {
 			progressCb(ProgressEvent{
@@ -618,7 +594,7 @@ func dryRunDictCompression(
 		}
 
 		// Compress to discard to measure size
-		comprSize, err := compressFileWithDict(task, &godelta.DiscardCounter{}, dictionary, opts.Level, progressCb)
+		comprSize, err := compressFileWithDict(task, &godelta.DiscardCounter{}, enc, progressCb)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.RelPath, err))
 			if progressCb != nil {

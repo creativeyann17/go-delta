@@ -2,7 +2,6 @@
 package decompress
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -77,6 +76,24 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 	}
 	defer decoder.Close()
 
+	// Count how many times each chunk is referenced across all files. Chunks
+	// referenced more than once are kept decompressed in a bounded cache so
+	// deduplicated data is not re-read and re-decompressed per occurrence.
+	chunkRefs := make(map[[32]byte]int)
+	for _, metadata := range fileMetadataList {
+		for _, h := range metadata.ChunkHashes {
+			chunkRefs[h]++
+		}
+	}
+
+	// maxChunkCacheBytes bounds the decompressed-chunk cache memory
+	const maxChunkCacheBytes = 128 * 1024 * 1024
+	chunkCache := make(map[[32]byte][]byte)
+	var chunkCacheBytes int
+
+	// Reusable buffers for compressed reads and decompressed scratch
+	var readBuf, scratch []byte
+
 	// Decompress each file by reassembling its chunks
 	var totalDecompSize uint64
 
@@ -128,6 +145,37 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 			fmt.Printf("  %s: reassembling %d chunks\n", metadata.RelPath, len(metadata.ChunkHashes))
 		}
 		for _, chunkHash := range metadata.ChunkHashes {
+			chunkRefs[chunkHash]--
+
+			// Cached decompressed chunk: skip the read + decompress entirely
+			if data, ok := chunkCache[chunkHash]; ok {
+				n, err := outFile.Write(data)
+				if chunkRefs[chunkHash] <= 0 {
+					chunkCacheBytes -= len(data)
+					delete(chunkCache, chunkHash)
+				}
+				if err != nil {
+					outFile.Close()
+					os.Remove(outputPath)
+					result.Errors = append(result.Errors, fmt.Errorf("%s: write chunk: %w", metadata.RelPath, err))
+					if progressCb != nil {
+						progressCb(ProgressEvent{Type: EventError, FilePath: metadata.RelPath})
+					}
+					break
+				}
+				bytesWritten += uint64(n)
+				if progressCb != nil {
+					progressCb(ProgressEvent{
+						Type:         EventFileProgress,
+						FilePath:     metadata.RelPath,
+						Current:      int64(bytesWritten),
+						Total:        int64(metadata.OrigSize),
+						CurrentBytes: bytesWritten,
+					})
+				}
+				continue
+			}
+
 			chunkInfo, exists := chunkIndex[chunkHash]
 			if !exists {
 				outFile.Close()
@@ -151,8 +199,11 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 				break
 			}
 
-			// Read compressed chunk
-			compressedData := make([]byte, chunkInfo.CompressedSize)
+			// Read compressed chunk into the reusable buffer
+			if uint64(cap(readBuf)) < chunkInfo.CompressedSize {
+				readBuf = make([]byte, chunkInfo.CompressedSize)
+			}
+			compressedData := readBuf[:chunkInfo.CompressedSize]
 			if _, err := io.ReadFull(archiveFile, compressedData); err != nil {
 				outFile.Close()
 				os.Remove(outputPath)
@@ -163,11 +214,12 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 				break
 			}
 
-			// Decompress chunk using the reusable decoder
-			if err := decoder.Reset(bytes.NewReader(compressedData)); err != nil {
+			// Decompress chunk in one call (appends into reusable scratch)
+			decompressed, err := decoder.DecodeAll(compressedData, scratch[:0])
+			if err != nil {
 				outFile.Close()
 				os.Remove(outputPath)
-				result.Errors = append(result.Errors, fmt.Errorf("%s: reset decoder: %w", metadata.RelPath, err))
+				result.Errors = append(result.Errors, fmt.Errorf("%s: decompress chunk: %w", metadata.RelPath, err))
 				if progressCb != nil {
 					progressCb(ProgressEvent{Type: EventError, FilePath: metadata.RelPath})
 				}
@@ -175,8 +227,7 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 			}
 
 			// Write decompressed chunk to output file
-			n, err := io.Copy(outFile, decoder)
-
+			n, err := outFile.Write(decompressed)
 			if err != nil {
 				outFile.Close()
 				os.Remove(outputPath)
@@ -185,6 +236,17 @@ func decompressGDelta02(archiveFile *os.File, opts *Options, progressCb Progress
 					progressCb(ProgressEvent{Type: EventError, FilePath: metadata.RelPath})
 				}
 				break
+			}
+
+			// Chunk referenced again later: cache the decompressed bytes.
+			// The buffer's ownership moves to the cache, so drop the scratch
+			// reference; otherwise keep it for reuse on the next chunk.
+			if chunkRefs[chunkHash] > 0 && chunkCacheBytes+len(decompressed) <= maxChunkCacheBytes {
+				chunkCache[chunkHash] = decompressed
+				chunkCacheBytes += len(decompressed)
+				scratch = nil
+			} else {
+				scratch = decompressed
 			}
 
 			bytesWritten += uint64(n)

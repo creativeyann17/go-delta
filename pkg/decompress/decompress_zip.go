@@ -8,7 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/klauspost/compress/flate"
 )
+
+// progressReportStep is the minimum number of bytes between two
+// EventFileProgress emissions (see compress side for rationale).
+const progressReportStep = 1 << 20
 
 // decompressZip extracts files from standard ZIP archive(s)
 // Supports both single ZIP files and multi-part archives (archive_01.zip, archive_02.zip, ...)
@@ -101,6 +107,11 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 	}
 	defer zipReader.Close()
 
+	// Use klauspost/compress inflate (faster than stdlib compress/flate)
+	zipReader.RegisterDecompressor(zip.Deflate, func(r io.Reader) io.ReadCloser {
+		return flate.NewReader(r)
+	})
+
 	// Extract each file
 	for _, zipFile := range zipReader.File {
 		// Notify file start
@@ -171,7 +182,7 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 		}
 
 		// Copy data with progress tracking
-		var written int64
+		var written, lastReported int64
 		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
 			nr, errRead := rc.Read(buf)
@@ -191,8 +202,9 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 				}
 				written += int64(nw)
 
-				// Report progress
-				if progressCb != nil {
+				// Report progress (throttled; EventFileComplete finishes the bar)
+				if progressCb != nil && written-lastReported >= progressReportStep {
+					lastReported = written
 					progressCb(ProgressEvent{
 						Type:     EventFileProgress,
 						FilePath: zipFile.Name,
