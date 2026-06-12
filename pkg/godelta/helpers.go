@@ -54,6 +54,10 @@ type Result interface {
 // ProgressBarCallback creates a progress callback that displays multi-progress bars
 // Works for both compression and decompression
 // Returns the callback function and the progress container (call Wait() after operation)
+//
+// The overall bar is byte-weighted when total bytes are known: a file-count
+// bar crawls through big files then leaps across thousands of small ones.
+// Falls back to file counting when TotalBytes is not provided.
 func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 	progress := mpb.New(
 		mpb.WithWidth(60),
@@ -63,20 +67,53 @@ func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 	var overallBar *mpb.Bar
 	var fileBars sync.Map // map[string]*mpb.Bar
 
+	// Byte accounting for the overall bar (events arrive from worker goroutines)
+	var mu sync.Mutex
+	byteMode := false
+	lastBytes := make(map[string]int64) // per in-flight file, bytes already added
+
+	// addOverallBytes credits the overall bar with this file's byte delta
+	addOverallBytes := func(filePath string, current int64) {
+		mu.Lock()
+		delta := current - lastBytes[filePath]
+		if delta > 0 {
+			lastBytes[filePath] = current
+		}
+		mu.Unlock()
+		if delta > 0 && overallBar != nil {
+			overallBar.IncrBy(int(delta))
+		}
+	}
+
 	callback := func(event ProgressEvent) {
 		switch event.Type {
 		case EventStart:
-			// Create overall progress bar (at bottom via priority)
-			overallBar = progress.AddBar(event.Total,
-				mpb.PrependDecorators(
-					decor.Name("Total", decor.WC{C: decor.DindentRight | decor.DextraSpace}),
-					decor.CountersNoUnit("%d / %d", decor.WCSyncWidth),
-				),
-				mpb.AppendDecorators(
-					decor.Percentage(decor.WC{W: 5}),
-				),
-				mpb.BarPriority(1000), // High priority = bottom
-			)
+			byteMode = event.TotalBytes > 0
+			if byteMode {
+				// Overall progress in bytes (at bottom via priority)
+				overallBar = progress.AddBar(int64(event.TotalBytes),
+					mpb.PrependDecorators(
+						decor.Name("Total", decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+						decor.CountersKibiByte("% .1f / % .1f", decor.WCSyncWidth),
+					),
+					mpb.AppendDecorators(
+						decor.Percentage(decor.WC{W: 5}),
+					),
+					mpb.BarPriority(1000), // High priority = bottom
+				)
+			} else {
+				// Total bytes unknown: fall back to file counting
+				overallBar = progress.AddBar(event.Total,
+					mpb.PrependDecorators(
+						decor.Name("Total", decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+						decor.CountersNoUnit("%d / %d", decor.WCSyncWidth),
+					),
+					mpb.AppendDecorators(
+						decor.Percentage(decor.WC{W: 5}),
+					),
+					mpb.BarPriority(1000),
+				)
+			}
 
 		case EventFileStart:
 			// Skip creating bars for empty files (Total=0) - they complete instantly
@@ -101,6 +138,9 @@ func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 			if bar, ok := fileBars.Load(event.FilePath); ok {
 				bar.(*mpb.Bar).SetCurrent(event.Current)
 			}
+			if byteMode {
+				addOverallBytes(event.FilePath, event.Current)
+			}
 
 		case EventFileComplete:
 			if bar, ok := fileBars.Load(event.FilePath); ok {
@@ -114,7 +154,13 @@ func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 				}
 				fileBars.Delete(event.FilePath)
 			}
-			if overallBar != nil {
+			if byteMode {
+				// Credit the remainder of the file, then forget it
+				addOverallBytes(event.FilePath, event.Total)
+				mu.Lock()
+				delete(lastBytes, event.FilePath)
+				mu.Unlock()
+			} else if overallBar != nil {
 				overallBar.Increment()
 			}
 
@@ -123,8 +169,19 @@ func ProgressBarCallback() (func(ProgressEvent), *mpb.Progress) {
 				bar.(*mpb.Bar).Abort(true)
 				fileBars.Delete(event.FilePath)
 			}
-			if overallBar != nil {
+			if byteMode {
+				mu.Lock()
+				delete(lastBytes, event.FilePath)
+				mu.Unlock()
+			} else if overallBar != nil {
 				overallBar.Increment()
+			}
+
+		case EventComplete:
+			// Force completion so progress.Wait() returns even when errored
+			// files left bytes uncredited (total <= 0 keeps the existing total)
+			if overallBar != nil {
+				overallBar.SetTotal(-1, true)
 			}
 		}
 	}
