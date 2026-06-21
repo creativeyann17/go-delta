@@ -161,6 +161,17 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 		// Construct output path
 		outPath := filepath.Join(opts.OutputPath, zipFile.Name)
 
+		// Directory entries: just ensure the directory exists and move on.
+		if zipFile.FileInfo().IsDir() {
+			if err := os.MkdirAll(outPath, 0755); err != nil {
+				recordError(fmt.Errorf("%s: mkdir: %w", zipFile.Name, err))
+			}
+			mu.Lock()
+			result.FilesProcessed++
+			mu.Unlock()
+			continue
+		}
+
 		// Check if file already exists
 		if !opts.Overwrite {
 			if _, err := os.Stat(outPath); err == nil {
