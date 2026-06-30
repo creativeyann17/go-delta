@@ -89,8 +89,17 @@ func decompressGDelta03(archiveFile *os.File, opts *Options, progressCb Progress
 			})
 		}
 
-		// Build output path
-		outputPath := filepath.Join(opts.OutputPath, entry.Path)
+		// Build output path, rejecting entries that would escape OutputPath
+		outputPath, pathErr := safeJoin(opts.OutputPath, entry.Path)
+		if pathErr != nil {
+			// Skip compressed data to maintain position
+			archiveFile.Seek(int64(entry.CompressedSize), io.SeekCurrent)
+			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", entry.Path, pathErr))
+			if progressCb != nil {
+				progressCb(ProgressEvent{Type: EventError, FilePath: entry.Path})
+			}
+			continue
+		}
 
 		// Create parent directories
 		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {

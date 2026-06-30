@@ -248,8 +248,11 @@ func decompressEntryAt(
 	opts *Options,
 	progressCb ProgressCallback,
 ) (decompressedSize uint64, err error) {
-	// Construct output path
-	outPath := filepath.Join(opts.OutputPath, entry.Path)
+	// Construct output path, rejecting entries that would escape OutputPath
+	outPath, err := safeJoin(opts.OutputPath, entry.Path)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", entry.Path, err)
+	}
 
 	// Check if file exists
 	if !opts.Overwrite {

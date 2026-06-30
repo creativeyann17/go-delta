@@ -167,8 +167,22 @@ func extractTarXzFile(xzPath string, opts *Options, progressCb ProgressCallback,
 			})
 		}
 
-		// Construct output path
-		outPath := filepath.Join(opts.OutputPath, header.Name)
+		// Construct output path, rejecting entries that would escape OutputPath
+		outPath, pathErr := safeJoin(opts.OutputPath, header.Name)
+		if pathErr != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", header.Name, pathErr))
+			if progressCb != nil {
+				progressCb(ProgressEvent{
+					Type:     EventError,
+					FilePath: header.Name,
+				})
+			}
+			// Skip the file data
+			if _, err := io.CopyN(io.Discard, tarReader, header.Size); err != nil && err != io.EOF {
+				return fmt.Errorf("skip file data: %w", err)
+			}
+			continue
+		}
 
 		// Check if file already exists
 		if !opts.Overwrite {

@@ -251,8 +251,11 @@ func decompressChunkedFile(
 	opts *Options,
 	progressCb ProgressCallback,
 ) error {
-	// Build output path
-	outputPath := filepath.Join(opts.OutputPath, metadata.RelPath)
+	// Build output path, rejecting entries that would escape OutputPath
+	outputPath, err := safeJoin(opts.OutputPath, metadata.RelPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", metadata.RelPath, err)
+	}
 
 	// Create parent directories
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {

@@ -12,4 +12,8 @@ var (
 
 	// ErrFileExists is returned when output file exists and overwrite is false
 	ErrFileExists = errors.New("file exists (use --overwrite to replace)")
+
+	// ErrUnsafeEntryPath is returned when an archive entry's stored path
+	// would resolve outside the extraction output directory (zip-slip).
+	ErrUnsafeEntryPath = errors.New("entry path escapes output directory")
 )

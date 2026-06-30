@@ -158,8 +158,18 @@ func extractZipFile(zipPath string, opts *Options, progressCb ProgressCallback, 
 			})
 		}
 
-		// Construct output path
-		outPath := filepath.Join(opts.OutputPath, zipFile.Name)
+		// Construct output path, rejecting entries that would escape OutputPath
+		outPath, err := safeJoin(opts.OutputPath, zipFile.Name)
+		if err != nil {
+			recordError(fmt.Errorf("%s: %w", zipFile.Name, err))
+			if progressCb != nil {
+				progressCb(ProgressEvent{
+					Type:     EventError,
+					FilePath: zipFile.Name,
+				})
+			}
+			continue
+		}
 
 		// Directory entries: just ensure the directory exists and move on.
 		if zipFile.FileInfo().IsDir() {
